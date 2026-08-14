@@ -50,5 +50,5 @@ pub fn upgrade_binary() -> Result<()> {
 }
 
 pub fn run_service(_config: std::path::PathBuf) -> Result<()> {
-    bail!("`service-run` is the Windows SCM entry point and is not available on this platform")
+    bail!("`service run` is the Windows SCM entry point and is not available on this platform")
 }

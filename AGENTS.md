@@ -8,9 +8,9 @@ Fork positioning (must stay true):
 
 - **Wire protocol 100% upstream-compatible** (`src/protocol.rs` is byte-frozen; never change message shapes).
 - Subcommand-driven CLI (`rathole-x` binary) with interactive + agent-friendly (`--json`, `--yes`) modes.
-- Zero handcrafted config files: `install` + `config add/set` manage everything; hot reload applies changes without restart.
-- One process can run BOTH server and client (dual mode) when the config has both sections.
-- Windows: SCM service + UAC elevation + permission model (`auth.toml`). Linux systemd: planned only (`docs/plan-linux-service.md`).
+- Zero handcrafted config files: `service install` + `config add/set` manage everything; hot reload applies changes without restart.
+- One process can run BOTH server and client (dual mode) when the config has both sections — daemon `run` only; installed services are strictly single-role (one service per role, install two to run both).
+- Windows: SCM service + UAC elevation + ACL-probed config permission model with a `version.toml` version stamp (no separate policy file). Linux systemd: planned only (`docs/plan-linux-service.md`).
 - Upstream boundaries in `docs/out-of-scope.md` still apply (no HTTP domain forwarding, no app-layer logging, etc.).
 
 ## Architecture & Data Flow
@@ -27,7 +27,7 @@ main.rs (parse Cli, stdio redirect for UAC relay, tracing init)
        │                              service events fanned out to every half
        ├─ config {add|remove|list|set} → config_edit (toml_edit, atomic write) → file event → hot reload
        ├─ status → tree renderer + SCM query
-       └─ install/uninstall → platform::install_service/uninstall_service (UAC relay + SCM)
+       └─ service {install|uninstall|start|stop|restart|run} → platform::install_service/uninstall_service/control_service/run_service (UAC relay + SCM)
 ```
 
 **Hot reload loop**: CLI writes config (temp file + rename, `write_atomic`) → notify event → watcher rescans → `calculate_events` diffs → `ServerChange/ClientChange::Add/Delete` hot-applied per half, `General` restarts the instance in-process. Invalid rescans keep the old config (`src/config_watcher.rs`).
@@ -84,8 +84,8 @@ cargo check --target x86_64-unknown-linux-gnu --no-default-features --features e
 | `src/cli.rs` | Entire CLI surface incl. hidden `--elevated-log` (global, required by UAC relay) |
 | `src/config.rs` | Schema; defaults live here (`default_heartbeat_timeout` etc.) |
 | `src/config_watcher.rs` | Hot reload diffing; rescan-failure semantics |
-| `src/config_edit.rs` | All config write paths; auth.toml policy; skeletons |
-| `src/platform/windows.rs` | SCM install/uninstall, UAC relay (`relaunch_elevated_wait` + `--elevated-log` replay), ACL grants, binary self-copy, `uninstall.bat` |
+| `src/config_edit.rs` | All config write paths; version.toml policy; skeletons |
+| `src/platform/windows.rs` | SCM install/uninstall, UAC relay (`relaunch_elevated_wait` + `--elevated-log` replay), ACL grants, binary self-copy, per-service `uninstall-<N>.bat` |
 | `src/status.rs` | Status tree + `--json` shape |
 | `build.rs` | vergen WITHOUT git feature (native libgit2 breaks MSVC; `VERGEN_GIT_*` don't exist) |
 | `examples/tls/` | TLS test material; certs expire (~1y) — regenerate with `sh create_self_signed_cert.sh` under `MSYS_NO_PATHCONV=1` |
@@ -103,13 +103,13 @@ cargo check --target x86_64-unknown-linux-gnu --no-default-features --features e
 ## Service Lifecycle Facts
 
 - Multi-service model: `service install <server|client> --yes --name N` → SCM `rathole-x-<role>-<N>`, config `<config_dir>/<N>.toml`, shared binary + per-service `uninstall-<N>.bat`. Single-role configs only: `config` ops enforce the role (server config rejects client entries).
-- `service start|stop|restart [--name|--all]`, `upgrade --yes` (stop all → replace shared binary → start all), `uninstall --yes --all` (removes everything). Uninstalling an already-removed service cleans leftovers WITHOUT UAC; normal uninstall leaves the kept config user-deletable (icacls :M).
-- The SCM `launch_arguments` MUST be `["service-run", "--config", <path>]` — missing `--config` makes the service exit at startup (SCM error 1053); guarded by a unit test.
+- `service start|stop|restart [--name|--all]`, `upgrade --yes` (stop all → replace shared binary → start all), `service uninstall --yes --all` (removes everything). Uninstalling an already-removed service cleans leftovers WITHOUT UAC; normal uninstall leaves the kept config user-deletable (icacls :M).
+- The SCM `launch_arguments` MUST be `["service", "run", "--config", <path>]` — missing `--config` makes the service exit at startup (SCM error 1053); guarded by a unit test.
 - `run_with_config` hibernates when the config is missing/invalid at startup (2s retry + "Degraded: waiting for a config update"), recovers on the next valid config — the service never dies from a bad config.
 
 ## Testing & QA
 
 - **Integration** (`tests/integration_test.rs`): spawns echo (8080) + pingpong (8081) servers, runs rathole in-process via `rathole::run` for each of 5 transports (tcp/tls/noise/websocket/websocket_tls), asserts TCP and UDP round-trips; covers control-channel crash/restart and load phases. Ports 2333 (control) / 2334-2335 (services) / 8080-8081 must be free — a locally running rathole service breaks them.
-- **Unit tests**: in-source `#[cfg(test)]` modules; scratch dirs under `std::env::temp_dir()` with `remove_dir_all` cleanup. Key coverage: config validation, watcher diffing, auth/version policy gates, Windows file ops (binary copy, uninstall.bat, purge semantics), `determine_run_mode` table.
+- **Unit tests**: in-source `#[cfg(test)]` modules; scratch dirs under `std::env::temp_dir()` with `remove_dir_all` cleanup. Key coverage: config validation, watcher diffing, version policy gates, Windows file ops (binary copy, uninstall-<N>.bat, purge semantics), `determine_run_mode` table.
 - **Expectations**: new observable CLI/config behavior needs a unit test (config_edit policy patterns) or an integration case; run the full `cargo test --verbose` before delivery. UI/CLI output verified by actually running the binary (`cargo run -- <cmd>` smoke), not just tests.
 - Known environmental trap: TLS test certs expire; regenerate per `examples/tls` (see Important Files).

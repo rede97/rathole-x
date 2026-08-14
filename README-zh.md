@@ -21,21 +21,21 @@ rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://g
 ## Design philosophy
 
 - **单一二进制、子命令驱动的 CLI。** 对人友好：交互式提示 + 自动生成的 token 与 noise 密钥。对脚本/Agent 友好：所有操作都有对应 flag，支持 `--json` 输出与 `--yes` 非交互模式。
-- **免手写配置文件。** `install` 部署系统服务并创建统一的空默认配置（一个无任何服务的静默客户端）；`config add`/`config set` 管理全部内容；热重载无需重启即可应用变更。
-- **单进程同时运行 server 与 client**，当配置同时含 `[server]` 与 `[client]` 段时。
+- **免手写配置文件。** `service install <server|client>` 部署系统服务并创建角色专属的骨架配置；`config add`/`config set` 管理全部内容；热重载无需重启即可应用变更。
+- **一个服务一个角色。** 每个已安装服务只运行一个角色（server 或 client），拥有各自的配置文件；同一台机器需要同时运行 server 与 client 时安装两个服务即可——各服务可独立安装、升级与观测（Unix 哲学）。前台守护进程（`run`）仍支持单配置双段、单进程同时运行两段。
 - **与上游兼容的线协议。** `rathole-x` 使用与上游 rathole 相同的线协议，因此二者可互通。
 - **平台集成。** Windows SCM 服务 + UAC 提权；Linux systemd 已规划（见 [docs/plan-linux-service.md](docs/plan-linux-service.md)）。
 - **安全默认值。** token 为必填；配置编辑受实际文件权限约束——CLI 会探测当前用户是否可写该配置，仅当不可写时才提权（UAC）；服务二进制被复制到 `ProgramData`，非管理员无法替换。
 
 ## New features over upstream
 
-- **子命令驱动的 CLI** — `run`（运行守护进程）、`config add|remove|list|set`（管理服务配置）、`status`（服务状态 + 配置树）、`genkey`（生成 noise 密钥对）、`install`（安装为系统服务）、`uninstall`（卸载服务）。各 flag 见 [CLI reference](#cli-reference)。
-- **双模式** — 当配置同时含两段时，单进程同时运行 server 与 client。
+- **子命令驱动的 CLI** — `run`（运行守护进程）、`config add|remove|list|set`（管理服务配置）、`status`（服务状态 + 配置树）、`genkey`（生成 noise 密钥对）、`service install|uninstall|start|stop|restart`（系统服务生命周期）、`upgrade`（更新已安装二进制）。各 flag 见 [CLI reference](#cli-reference)。
+- **双模式（仅守护进程）** — `run` 在配置同时含两段时单进程运行 server 与 client；已安装的系统服务严格单角色，双角色需求通过安装两个服务实现。
 - **自动生成 token 与 noise 密钥** — `config add`/`config set` 在省略时自动生成。
 - **原子写入热重载** — `config add`/`config set`/`config remove` 原子重写配置；运行中的服务无需重启即热重载；配置无效时进程休眠等待恢复。
 - **Windows 服务安装** — `service install server|client --name <n>` 注册一个命名 SCM 服务（AutoStart，SCM 名称为 `rathole-x-<role>-<N>`），拥有各自独立的配置文件；二进制被复制到配置旁，非管理员不可替换；每个服务写入一个 `uninstall-<n>.bat`；是否允许非管理员编辑配置由实际权限决定（无策略文件）。
 - **状态树视图** — `status` 打印服务状态 + 配置树（无参数列出全部服务，`--name N` 查看单服务，`--json` 供脚本使用）。
-- **默认配置自动创建** — `install` 在缺失时创建统一的空默认配置。
+- **角色骨架自动创建** — `service install` 在缺失时创建角色专属的骨架配置。
 
 ## Quick start (Windows)
 
@@ -68,14 +68,15 @@ rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://g
 4. 卸载服务。最后一个服务被移除时 `version.toml` 一并删除；除非传入 `--purge`，否则配置文件保留：
 
 ```bash
-./rathole-x service uninstall --yes
+./rathole-x service uninstall --yes --name relay
+./rathole-x service uninstall --yes --name home-nas
 ```
 
 > **Linux systemd** 服务支持已规划 — 见 [docs/plan-linux-service.md](docs/plan-linux-service.md)。
 
 ## Config schema versioning
 
-`version.toml` 文件（由 `install` 写入）记录了安装该服务的 rathole-x 构建的**大版本号**。`config add`/`config set`/`config remove` 会拒绝操作其大版本戳与当前 CLI 不一致的配置：
+`version.toml` 文件（由 `service install` 写入）记录了安装该服务的 rathole-x 构建的**大版本号**。`config add`/`config set`/`config remove` 会拒绝操作其大版本戳与当前 CLI 不一致的配置：
 
 ```
 This config is managed by rathole-x v0 but this CLI is v1.
@@ -147,17 +148,19 @@ Reinstall the service to upgrade: `rathole-x service uninstall --yes` then `rath
 
 ## CLI reference
 
-每个子命令都接受 `--json` 以获得机器可读输出；`install` 和 `uninstall` 需要 `--yes` 来确认。上游的位置参数形式 `./rathole config.toml` 在本分支中**不受支持**——用 `run -c CONFIG` 运行守护进程（不带 `-c` 时使用系统默认路径：Windows 为 `%ProgramData%\rathole-x\rathole-x.toml`，Linux 为 `/etc/rathole-x.toml`）。
+`config add|remove|list|set` 与 `status` 接受 `--json` 以获得机器可读输出；`service install`、`service uninstall` 与 `upgrade` 需要 `--yes` 来确认。上游的位置参数形式 `./rathole config.toml` 在本分支中**不受支持**——用 `run -c CONFIG` 运行守护进程（不带 `-c` 时使用系统默认路径：Windows 为 `%ProgramData%\rathole-x\rathole-x.toml`，Linux 为 `/etc/rathole-x.toml`）。带 `--name` 的命令操作同名的已安装服务；同时省略 `--name` 与 `-c` 且恰好只安装了一个服务时，自动使用该服务。
 
-- `run [-c CONFIG] [--server|--client]` — 运行守护进程；`--server`/`--client` 强制指定模式。
-- `add [<NAME>] [--client SPEC]... [--server SPEC]... [--remote-addr A] [--bind-addr A] [--local-addr A] [--token T] [--noise] [--noise-key K] [--type tcp|udp] [-c] [--json] [--yes]` — 按名称和 flag 添加服务，或通过可重复的 `--client "server:...;name:...;local:...;token:...;type:..."` / `--server "name:...;bind:...;token:...;type:..."` 规格批量添加（一次写入、一次热重载）。在 TTY 中不指定名称时，会运行多轮交互式向导（空名称结束）。Client 规格接受 `server:` 键：在全新段上设置 [client] 默认值，否则作为按服务覆盖（一个 client 可连接多个服务器）。
-- `remove <NAME> [-c] [--json]` — 移除服务。
-- `list [-c] [--json]` — 列出服务。
-- `set <--client|--server> [global fields] [-c] [--json]` — 设置全局字段：`--remote-addr`、`--bind-addr`、`--default-token`、`--prefer-ipv6`、`--heartbeat-timeout`、`--retry-interval`、`--heartbeat-interval`、`--transport tcp|tls|noise|websocket`、`--noise`、`--noise-key`、`--trusted-root`、`--hostname`、`--pkcs12`、`--pkcs12-password`、`--ws-tls`、`--nodelay`、`--keepalive-secs`、`--keepalive-interval`、`--proxy`。
+- `run [-c CONFIG] [--server|--client]` — 运行守护进程；`--server`/`--client` 强制指定模式。双段配置在单进程中同时运行两段。
+- `config add [<NAME>] [--client SPEC]... [--server SPEC]... [--remote-addr A] [--bind-addr A] [--local-addr A] [--token T] [--noise] [--noise-key K] [--type tcp|udp] [-c] [--name N] [--json] [--yes]` — 按名称和 flag 添加服务，或通过可重复的 `--client "server:...;name:...;local:...;token:...;type:..."` / `--server "name:...;bind:...;token:...;type:..."` 规格批量添加（一次写入、一次热重载）。在 TTY 中不指定名称时，会运行多轮交互式向导（空名称结束）。Client 规格接受 `server:` 键：在全新段上设置 [client] 默认值，否则作为按服务覆盖（一个 client 可连接多个服务器）。
+- `config remove <NAME> [-c] [--name N] [--json]` — 移除服务。
+- `config list [-c] [--name N] [--json]` — 列出服务。
+- `config set <--client|--server> [global fields] [-c] [--name N] [--json]` — 设置全局字段：`--remote-addr`、`--bind-addr`、`--default-token`、`--prefer-ipv6`、`--heartbeat-timeout`、`--retry-interval`、`--heartbeat-interval`、`--transport tcp|tls|noise|websocket`、`--noise`、`--noise-key`、`--trusted-root`、`--hostname`、`--pkcs12`、`--pkcs12-password`、`--ws-tls`、`--nodelay`、`--keepalive-secs`、`--keepalive-interval`、`--proxy`。
 - `status [-c] [--name N] [--json]` — 打印服务状态与配置树；无参数列出全部服务，`--name N` 查看单服务，`--json` 供脚本使用。
 - `genkey [--curve x25519|x448]` — 生成 noise 密钥对。
-- `service install <server|client> --yes [--name N] [--allow-user-config]` — 安装系统服务（二选一角色）：缺失时创建角色骨架配置、将二进制复制到配置旁、写入 `uninstall-<N>.bat`，并以 UAC 注册 Windows SCM 服务（AutoStart）。缺少 `--yes` 时仅打印用法。
-- `service uninstall --yes [--name N] [--purge] [--all]` — 卸载命名服务；`--all` 全量清除；最后一个服务被移除时 `version.toml` 一并删除，除非 `--purge`，否则配置保留。
+- `service install <server|client> --yes [-c] [--name N] [--allow-user-config]` — 安装系统服务（二选一角色）：缺失时创建角色骨架配置、将二进制复制到配置旁、写入 `uninstall-<N>.bat`，并以 UAC 注册 Windows SCM 服务（AutoStart）。`--name` 缺省为 "default"。缺少 `--yes` 时仅打印用法。
+- `service uninstall --yes [--name N] [-c] [--purge] [--all]` — 卸载命名服务；`--all` 全量清除（所有服务、全部配置与共享二进制）；最后一个服务被移除时 `version.toml` 一并删除，除非 `--purge`，否则配置保留。
+- `service start|stop|restart [--name N | --all]` — 驱动已安装服务的 SCM 状态（需要时 UAC 提权）。
+- `upgrade --yes` — 原地更新已安装的二进制：停止所有服务、用当前运行的二进制替换共享二进制、再重新启动它们。
 
 ---
 

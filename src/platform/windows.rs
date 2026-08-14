@@ -7,7 +7,7 @@
 //! - SCM registration (`install`/`uninstall`) plus the CLI flow wrappers
 //!   (`install_service`/`uninstall_service`/`elevate_for_config_if_needed`),
 //! - the service entry point (`run_service`) dispatched via the hidden
-//!   `service-run` subcommand when the Service Control Manager starts us.
+//!   `service run` subcommand when the Service Control Manager starts us.
 #![cfg(windows)]
 
 use crate::cli::{InstallArgs, UninstallArgs};
@@ -61,7 +61,7 @@ pub struct ServiceInstallOptions {
     pub name: String,
     /// The role the service runs as.
     pub role: crate::config_edit::ServiceRole,
-    /// Resolved absolute config path passed to `service-run --config`.
+    /// Resolved absolute config path passed to `service run --config`.
     pub config_path: PathBuf,
     /// Allow non-admin users to modify the config (ACL) and have the CLI
     /// write it without elevation. Stored in `version.toml` next to the config;
@@ -227,7 +227,7 @@ pub fn relaunch_elevated_wait(args: &[String]) -> Result<String> {
     Ok(output)
 }
 
-/// The SCM launch arguments: hidden service-run entry + config flag.
+/// The SCM launch arguments: hidden `service run` entry + config flag.
 /// The --config flag is load-bearing: without it the service exits at
 /// startup and the SCM reports error 1053.
 fn launch_arguments(config_path: &Path) -> Vec<OsString> {
@@ -240,7 +240,7 @@ fn launch_arguments(config_path: &Path) -> Vec<OsString> {
 }
 
 /// Create and start a Windows service that runs
-/// `"<current_exe>" service-run --config "<config_path>"` at boot.
+/// `"<current_exe>" service run --config "<config_path>"` at boot.
 /// Also writes the `version.toml` policy and, when allowed, opens the config
 /// ACL to BUILTIN\Users.
 pub fn install(opts: &ServiceInstallOptions) -> Result<()> {
@@ -258,7 +258,7 @@ pub fn install(opts: &ServiceInstallOptions) -> Result<()> {
     std::fs::write(
         version_path(&opts.config_path),
         format!(
-            "# Written by `rathole-x install`. Reinstall the service to change this.\n\
+            "# Written by `rathole-x service install`. Reinstall the service to change this.\n\
              version = {}\n",
             crate::cli::major_version()
         ),
@@ -377,8 +377,6 @@ fn ensure_binary_copy(source: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Write an `uninstall.bat` next to the installed binary so the service can
-/// be removed without the original binary. Purge is opt-in, matching the CLI.
 /// Write an `uninstall-<name>.bat` next to the installed binary so the
 /// service can be removed without the original binary. Purge is opt-in,
 /// matching the CLI.
@@ -599,7 +597,7 @@ fn remove_service_files(config_path: &Path, purge: bool) {
 }
 
 // ---------------------------------------------------------------------------
-// Service entry point (invoked by the SCM via `service-run`)
+// Service entry point (invoked by the SCM via `service run`)
 // ---------------------------------------------------------------------------
 
 define_windows_service!(ffi_service_main, service_main);
@@ -608,14 +606,14 @@ define_windows_service!(ffi_service_main, service_main);
 /// invokes on a different thread with no way to pass user data.
 static SERVICE_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
-/// Entry point of the hidden `service-run` subcommand. Connects this process
+/// Entry point of the hidden `service run` subcommand. Connects this process
 /// to the SCM dispatcher and blocks until the service stops.
 pub fn run_service(config_path: PathBuf) -> Result<()> {
     SERVICE_CONFIG_PATH
         .set(config_path)
         .map_err(|_| anyhow!("service config path already initialized"))?;
     service_dispatcher::start(SERVICE_NAME, ffi_service_main)
-        .context("failed to connect to the service control manager; `service-run` must be started by the SCM")?;
+        .context("failed to connect to the service control manager; `service run` must be started by the SCM")?;
     Ok(())
 }
 
@@ -790,7 +788,7 @@ fn service_main_inner(config_path: PathBuf) -> Result<()> {
     run_result
 }
 
-/// CLI flow for `rathole-x install`: print the plan in the caller's window,
+/// CLI flow for `rathole-x service install`: print the plan in the caller's window,
 /// elevate if needed (the elevated phase runs hidden), and run the SCM
 /// registration. Every user-visible line is printed from this process.
 pub fn install_service(
@@ -835,7 +833,7 @@ pub fn install_service(
     Ok(())
 }
 
-/// CLI flow for `rathole-x uninstall`: print the plan in the caller's
+/// CLI flow for `rathole-x service uninstall`: print the plan in the caller's
 /// window. When the service is already gone the leftover files are removed
 /// WITHOUT elevation; otherwise the elevated phase removes the service.
 /// After a normal uninstall the kept config is left user-deletable.
@@ -907,7 +905,7 @@ pub fn uninstall_service(args: &UninstallArgs, config_path: &Path) -> Result<()>
     Ok(())
 }
 
-/// `rathole-x uninstall --all`: remove every installed service, every
+/// `rathole-x service uninstall --all`: remove every installed service, every
 /// config, the leftover uninstall bats and the shared binary.
 pub fn uninstall_all(_args: &UninstallArgs) -> Result<()> {
     let services = crate::config_edit::list_installed_services()?;

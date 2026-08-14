@@ -349,7 +349,7 @@ fn render_one(
         }
         None => {
             let hint = if content.is_none() {
-                "file missing — run `rathole-x install server|client --yes`"
+                "file missing — run `rathole-x service install server|client --yes`"
             } else {
                 "invalid configuration — run `rathole-x config set` or fix the file"
             };
@@ -414,7 +414,7 @@ pub fn run_status(args: &StatusArgs) -> Result<()> {
         println!(
             "{}",
             colorize(
-                "no installed services — run `rathole-x install server|client --yes`",
+                "no installed services — run `rathole-x service install server|client --yes`",
                 YELLOW
             )
         );

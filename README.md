@@ -22,38 +22,42 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 ## Design philosophy
 
 - **One binary, subcommand-driven CLI.** Human-friendly: interactive prompts plus auto-generated tokens and noise keys. Agent-friendly: everything is available as flags, with `--json` output and a `--yes` non-interactive mode.
-- **Zero config-file handcrafting.** `install` deploys a system service with a unified empty default config (a silent client with no services); `config add`/`config set` manage everything; hot reload applies changes without restarting.
-- **One process runs both server and client** when the config has both `[server]` and `[client]` sections.
+- **Zero config-file handcrafting.** `service install <server|client>` deploys a system service with a role-specific skeleton config; `config add`/`config set` manage everything; hot reload applies changes without restarting.
+- **One service, one role.** Each installed service runs exactly one role (server or client) with its own config file; to run both on a host, install two services — each stays independently installable, upgradable and observable (Unix philosophy). The foreground daemon (`run`) still runs both sections of a single config in one process.
 - **Upstream-compatible wire protocol.** `rathole-x` speaks the same wire protocol as upstream rathole, so the two interoperate.
 - **Platform integration.** Windows SCM service plus UAC elevation; Linux systemd is planned (see [docs/plan-linux-service.md](docs/plan-linux-service.md)).
 - **Secure defaults.** Tokens are mandatory; config edits are gated by the actual file permissions — the CLI probes whether the current user can write the config and elevates (UAC) only when not; the service binary is copied into `ProgramData` and is not replaceable by non-admins.
 
 ## New features over upstream
 
-- **Subcommand-driven CLI** — `run` (run the daemon), `config add|remove|list|set` (manage the service configuration), `status` (service state + config tree), `genkey` (generate a noise keypair), `install` (install as a system service), `uninstall` (uninstall the service). See [CLI reference](#cli-reference) for flags.
-- **Dual mode** — one process runs both server and client when the config has both sections.
+- **Subcommand-driven CLI** — `run` (run the daemon), `config add|remove|list|set` (manage the service configuration), `status` (service state + config tree), `genkey` (generate a noise keypair), `service install|uninstall|start|stop|restart` (system service lifecycle), `upgrade` (update the installed binary). See [CLI reference](#cli-reference) for flags.
+- **Dual mode (daemon only)** — `run` executes both server and client in one process when the config has both sections; installed services are strictly single-role, so running both roles means installing two services.
 - **Auto-generated tokens and noise keys** — `config add`/`config set` generate them when omitted.
 - **Hot reload via atomic writes** — `config add`/`config set`/`config remove` rewrite the config atomically; the running service hot-reloads it without a restart.
 - **Windows service install** — `service install server|client --name <n>` registers a named SCM service (AutoStart) with its own config file; the binary is copied next to the configs and is not replaceable by non-admins; an `uninstall-<n>.bat` is written per service; whether non-admin users may edit a config is decided by its actual permissions (no policy file).
-- **Status tree view** — `status` prints the service state plus the config tree (`--json` for scripts).
-- **Default config auto-creation** — `install` creates a unified empty default config when none exists.
+- **Status tree view** — `status` prints the service state plus the config tree (`--name N` for a single service, `--json` for scripts).
+- **Role skeleton auto-creation** — `service install` creates a role-specific skeleton config when none exists.
 
 ## Quick start (Windows)
 
-1. Install the service from an elevated shell. `--yes` is mandatory: without it, only the usage is printed. A unified empty default config is created if missing, the binary is copied next to the config, and a Windows SCM service (AutoStart) is registered with UAC elevation:
+1. Install the services from an elevated shell — one named service per role; to run both server and client on a host, install two services. `--yes` is mandatory: without it, only the usage is printed. A role skeleton config is created if missing, the binary is copied next to the configs, and a Windows SCM service (AutoStart) is registered with UAC elevation:
 
 ```bash
-./rathole-x install --yes
+# Server (public IP)
+./rathole-x service install server --yes --name relay
+
+# Client (behind NAT)
+./rathole-x service install client --yes --name home-nas
 ```
 
 2. Add a service. The demo below exposes a NAS ssh service: the same name pairs the server and client sides, and tokens are auto-generated:
 
 ```bash
 # Server (public IP): expose port 5202 to the Internet
-./rathole-x config add --server "name:my_nas_ssh;bind:0.0.0.0:5202"
+./rathole-x config add --name relay --server "name:my_nas_ssh;bind:0.0.0.0:5202"
 
 # Client (behind NAT): forward to the NAS ssh daemon on port 22
-./rathole-x config add --client "server:myserver.com:2333;name:my_nas_ssh;local:127.0.0.1:22"
+./rathole-x config add --name home-nas --client "server:myserver.com:2333;name:my_nas_ssh;local:127.0.0.1:22"
 ```
 
 3. Check the service state and the configuration tree:
@@ -62,10 +66,11 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 ./rathole-x status
 ```
 
-4. Uninstall the service. `version.toml` is removed with the last service; the config file is kept unless `--purge` is passed:
+4. Uninstall a service. `version.toml` is removed with the last service; the config file is kept unless `--purge` is passed:
 
 ```bash
-./rathole-x service uninstall --yes
+./rathole-x service uninstall --yes --name relay
+./rathole-x service uninstall --yes --name home-nas
 ```
 
 > **Linux systemd** service support is planned — see [docs/plan-linux-service.md](docs/plan-linux-service.md).
@@ -79,7 +84,7 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 
 ## Config schema versioning
 
-The `version.toml` file (written by `install`) stamps the **major version** of the rathole-x build that installed the service. `config add`/`config set`/`config remove` refuse to touch a config whose stamped major version differs from the running CLI:
+The `version.toml` file (written by `service install`) stamps the **major version** of the rathole-x build that installed the service. `config add`/`config set`/`config remove` refuse to touch a config whose stamped major version differs from the running CLI:
 
 ```
 This config is managed by rathole-x v0 but this CLI is v1.
@@ -92,17 +97,19 @@ Read-only commands (`status`, `list`, `run`) and `install`/`uninstall` are never
 
 ## CLI reference
 
-Every subcommand accepts `--json` for machine-readable output; `install` and `uninstall` require `--yes` to confirm. The upstream positional `./rathole config.toml` form is **not supported** in this fork — run the daemon with `run -c CONFIG` (with no `-c`, the OS default path is used: Windows `%ProgramData%\rathole-x\rathole-x.toml`, Linux `/etc/rathole-x.toml`).
+`config add|remove|list|set` and `status` accept `--json` for machine-readable output; `service install`, `service uninstall` and `upgrade` require `--yes` to confirm. The upstream positional `./rathole config.toml` form is **not supported** in this fork — run the daemon with `run -c CONFIG` (with no `-c`, the OS default path is used: Windows `%ProgramData%\rathole-x\rathole-x.toml`, Linux `/etc/rathole-x.toml`). Commands with `--name` target the installed service of that name; when both `--name` and `-c` are omitted and exactly one service is installed, that one is used.
 
-- `run [-c CONFIG] [--server|--client]` — run the daemon; `--server`/`--client` force a mode.
-- `add [<NAME>] [--client SPEC]... [--server SPEC]... [--remote-addr A] [--bind-addr A] [--local-addr A] [--token T] [--noise] [--noise-key K] [--type tcp|udp] [-c] [--json] [--yes]` — add services by name and flags, or in batches via repeatable `--client "server:...;name:...;local:...;token:...;type:..."` / `--server "name:...;bind:...;token:...;type:..."` specs (one write, one hot-reload). Without a name in a TTY it runs a multi-round interactive wizard (empty name finishes). Client specs accept a `server:` key: it sets the [client] default on a fresh section, or a per-service override otherwise (a client may connect to several servers).
-- `remove <NAME> [-c] [--json]` — remove a service.
-- `list [-c] [--json]` — list services.
-- `set <--client|--server> [global fields] [-c] [--json]` — set global fields: `--remote-addr`, `--bind-addr`, `--default-token`, `--prefer-ipv6`, `--heartbeat-timeout`, `--retry-interval`, `--heartbeat-interval`, `--transport tcp|tls|noise|websocket`, `--noise`, `--noise-key`, `--trusted-root`, `--hostname`, `--pkcs12`, `--pkcs12-password`, `--ws-tls`, `--nodelay`, `--keepalive-secs`, `--keepalive-interval`, `--proxy`.
-- `status [-c] [--json]` — print the service state plus the config tree.
+- `run [-c CONFIG] [--server|--client]` — run the daemon; `--server`/`--client` force a mode. A dual-section config runs both halves in one process.
+- `config add [<NAME>] [--client SPEC]... [--server SPEC]... [--remote-addr A] [--bind-addr A] [--local-addr A] [--token T] [--noise] [--noise-key K] [--type tcp|udp] [-c] [--name N] [--json] [--yes]` — add services by name and flags, or in batches via repeatable `--client "server:...;name:...;local:...;token:...;type:..."` / `--server "name:...;bind:...;token:...;type:..."` specs (one write, one hot-reload). Without a name in a TTY it runs a multi-round interactive wizard (empty name finishes). Client specs accept a `server:` key: it sets the [client] default on a fresh section, or a per-service override otherwise (a client may connect to several servers).
+- `config remove <NAME> [-c] [--name N] [--json]` — remove a service.
+- `config list [-c] [--name N] [--json]` — list services.
+- `config set <--client|--server> [global fields] [-c] [--name N] [--json]` — set global fields: `--remote-addr`, `--bind-addr`, `--default-token`, `--prefer-ipv6`, `--heartbeat-timeout`, `--retry-interval`, `--heartbeat-interval`, `--transport tcp|tls|noise|websocket`, `--noise`, `--noise-key`, `--trusted-root`, `--hostname`, `--pkcs12`, `--pkcs12-password`, `--ws-tls`, `--nodelay`, `--keepalive-secs`, `--keepalive-interval`, `--proxy`.
+- `status [-c] [--name N] [--json]` — print the service state plus the config tree; without `--name` every installed service is listed.
 - `genkey [--curve x25519|x448]` — generate a noise keypair.
-- `install --yes [-c] [--name] [--allow-user-config]` — install as a system service: creates a default config if missing, copies the binary next to the config, writes `uninstall.bat`, and registers a Windows SCM service (AutoStart) with UAC. Without `--yes`, only the usage is printed.
-- `uninstall --yes [--name N] [--purge]` — uninstall the named service; `version.toml` is removed with the last service and the config is kept unless `--purge`.
+- `service install <server|client> --yes [-c] [--name N] [--allow-user-config]` — install a system service (exactly one role): creates a role skeleton config if missing, copies the binary next to the config, writes `uninstall-<N>.bat`, and registers a Windows SCM service (AutoStart) with UAC. `--name` defaults to "default". Without `--yes`, only the usage is printed.
+- `service uninstall --yes [--name N] [-c] [--purge] [--all]` — uninstall the named service; `--all` removes every installed service, all configs and the shared binary. `version.toml` is removed with the last service and the config is kept unless `--purge`.
+- `service start|stop|restart [--name N | --all]` — drive the SCM state of installed services (UAC elevated when needed).
+- `upgrade --yes` — stop every service, replace the shared binary with the running one, start them again.
 
 ---
 
