@@ -719,7 +719,7 @@ pub fn run_set(args: &SetArgs, path: &Path) -> Result<()> {
 
     // Save, prepending the skeleton when the file was just created
     if created {
-        write_atomic(path, &format!("{}\n{}", CONFIG_SKELETON, doc.to_string()))
+        write_atomic(path, &format!("{}\n{}", CONFIG_SKELETON, doc))
             .with_context(|| format!("Failed to write {}", path.display()))?;
     } else {
         save_document(path, &doc)?;
@@ -979,7 +979,7 @@ fn run_add_single(args: &AddArgs, path: &Path) -> Result<()> {
     if created {
         write_atomic(
             path,
-            &format!("{}\n{}", CONFIG_SKELETON, doc.to_string()),
+            &format!("{}\n{}", CONFIG_SKELETON, doc),
         )
         .with_context(|| format!("Failed to write {}", path.display()))?;
     } else {
@@ -1044,11 +1044,11 @@ fn ensure_role_allows(doc: &DocumentMut, requested: ServiceSide) -> Result<()> {
         return Ok(());
     }
     let role = detect_role(doc)?;
-    let ok = match (role, requested) {
-        (ServiceRole::Client, ServiceSide::Client) => true,
-        (ServiceRole::Server, ServiceSide::Server) => true,
-        _ => false,
-    };
+    let ok = matches!(
+        (role, requested),
+        (ServiceRole::Client, ServiceSide::Client)
+            | (ServiceRole::Server, ServiceSide::Server)
+    );
     if !ok {
         bail!(
             "This config is a {} config; {} entries do not belong here. \
@@ -1472,7 +1472,7 @@ fn insert_pending(doc: &mut DocumentMut, p: PendingService) -> Result<Value> {
 /// Save the doc, prepending the skeleton when the file was just created.
 fn save_with_skeleton(path: &Path, doc: &DocumentMut, created: bool) -> Result<()> {
     if created {
-        write_atomic(path, &format!("{}\n{}", CONFIG_SKELETON, doc.to_string()))
+        write_atomic(path, &format!("{}\n{}", CONFIG_SKELETON, doc))
             .with_context(|| format!("Failed to write {}", path.display()))?;
     } else {
         save_document(path, doc)?;
@@ -1775,9 +1775,6 @@ mod tests {
             perms.set_readonly(true);
             std::fs::set_permissions(&config, perms).unwrap();
             assert!(!writable_by_current_user(&config), "read-only file not writable");
-            let mut perms = std::fs::metadata(&config).unwrap().permissions();
-            perms.set_readonly(false);
-            std::fs::set_permissions(&config, perms).unwrap();
         }
 
         // Missing file: directory probe

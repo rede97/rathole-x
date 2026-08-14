@@ -171,7 +171,7 @@ pub fn relaunch_elevated_wait(args: &[String]) -> Result<String> {
             .unwrap_or(0)
     ));
 
-    let mut params: Vec<String> = args.iter().cloned().collect();
+    let mut params: Vec<String> = args.to_vec();
     params.push("--elevated-log".to_owned());
     params.push(log_path.to_string_lossy().into_owned());
     let params = params

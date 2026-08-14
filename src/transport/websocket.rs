@@ -25,6 +25,7 @@ use tokio_util::io::StreamReader;
 use url::Url;
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // upstream shape; boxing would churn call sites
 enum TransportStream {
     Insecure(TcpStream),
     Secure(TlsStream<TcpStream>),
@@ -95,7 +96,7 @@ impl Stream for StreamWrapper {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Ready(Some(Err(err))) => {
-                Poll::Ready(Some(Err(Error::new(ErrorKind::Other, err))))
+                Poll::Ready(Some(Err(Error::other(err))))
             }
             Poll::Ready(Some(Ok(res))) => {
                 if let Message::Binary(b) = res {
@@ -149,24 +150,24 @@ impl AsyncWrite for WebsocketTunnel {
         let sw = self.get_mut().inner.get_mut();
         ready!(Pin::new(&mut sw.inner)
             .poll_ready(cx)
-            .map_err(|err| Error::new(ErrorKind::Other, err)))?;
+            .map_err(Error::other))?;
 
         match Pin::new(&mut sw.inner).start_send(Message::Binary(buf.to_vec())) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
-            Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e))),
+            Err(e) => Poll::Ready(Err(Error::other(e))),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         Pin::new(&mut self.get_mut().inner.get_mut().inner)
             .poll_flush(cx)
-            .map_err(|err| Error::new(ErrorKind::Other, err))
+            .map_err(Error::other)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         Pin::new(&mut self.get_mut().inner.get_mut().inner)
             .poll_close(cx)
-            .map_err(|err| Error::new(ErrorKind::Other, err))
+            .map_err(Error::other)
     }
 }
 
@@ -237,7 +238,7 @@ impl Transport for WebsocketTransport {
     }
 
     async fn connect(&self, addr: &AddrMaybeCached) -> anyhow::Result<Self::Stream> {
-        let u = format!("ws://{}", &addr.addr.as_str());
+        let u = format!("ws://{}", addr.addr.as_str());
         let url = Url::parse(&u).unwrap();
         let tstream = match &self.sub {
             SubTransport::Insecure(t) => TransportStream::Insecure(t.connect(addr).await?),

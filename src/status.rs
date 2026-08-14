@@ -364,6 +364,7 @@ pub fn run_status(args: &StatusArgs) -> Result<()> {
         crate::config_edit::validate_service_name(name)?;
         let config_path = crate::config_edit::config_dir().join(format!("{}.toml", name));
 
+        #[cfg(windows)]
         let role = std::fs::read_to_string(&config_path)
             .ok()
             .and_then(|c| toml::from_str::<Config>(&c).ok())

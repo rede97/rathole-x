@@ -191,7 +191,7 @@ async fn do_data_channel_handshake<T: Transport>(
             args.connector
                 .connect(&args.remote_addr)
                 .await
-                .with_context(|| format!("Failed to connect to {}", &args.remote_addr))
+                .with_context(|| format!("Failed to connect to {}", args.remote_addr))
                 .map_err(backoff::Error::transient)
         },
         |e, duration| {
@@ -410,7 +410,7 @@ impl<T: 'static + Transport> ControlChannel<T> {
             .transport
             .connect(&remote_addr)
             .await
-            .with_context(|| format!("Failed to connect to {}", &self.remote_addr))?;
+            .with_context(|| format!("Failed to connect to {}", self.remote_addr))?;
         T::hint(&conn, SocketOpts::for_control_channel());
 
         // Send hello

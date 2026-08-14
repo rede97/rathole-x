@@ -82,10 +82,10 @@ pub enum Commands {
     Status(StatusArgs),
 
     /// Install rathole-x as a system service
-    Install(InstallArgs),
+    Install(Box<InstallArgs>),
 
     /// Uninstall the rathole-x system service
-    Uninstall(UninstallArgs),
+    Uninstall(Box<UninstallArgs>),
     /// Start, stop or restart an installed service
     Service {
         #[clap(subcommand)]
@@ -107,7 +107,7 @@ pub enum Commands {
 #[derive(Subcommand, Debug, Clone)]
 pub enum ConfigCmd {
     /// Add a service to the configuration file
-    Add(AddArgs),
+    Add(Box<AddArgs>),
 
     /// Remove a service from the configuration file
     Remove(RemoveArgs),
@@ -116,7 +116,7 @@ pub enum ConfigCmd {
     List(ListArgs),
 
     /// Update global fields of the [client] or [server] section
-    Set(SetArgs),
+    Set(Box<SetArgs>),
 }
 
 

@@ -253,10 +253,11 @@ async fn run_with_config(
     // A single process can host both a client and a server instance
     // (RunMode::Both), each with its own update channel; service events are
     // fanned out to every half.
-    let mut last_instance: Option<(
+    type Instance = (
         tokio::task::JoinHandle<Result<()>>,
         Vec<mpsc::Sender<ConfigChange>>,
-    )> = None;
+    );
+    let mut last_instance: Option<Instance> = None;
 
     while let Some(e) = cfg_watcher.event_rx.recv().await {
         match e {
