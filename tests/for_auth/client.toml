@@ -1,0 +1,11 @@
+# Client side of tests/auth_test.rs. Same service name as the server but a
+# different token: the server must reject the control channel handshake.
+[client]
+remote_addr = "127.0.0.1:12333"
+default_token = "client_side_token_B"
+
+[client.transport]
+type = "tcp"
+
+[client.services.echo]
+local_addr = "127.0.0.1:12081"

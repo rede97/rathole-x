@@ -51,13 +51,15 @@ impl Transport for TlsTransport {
 
         let tls_acceptor = match config.pkcs12.as_ref() {
             Some(path) => {
-                let ident = Identity::from_pkcs12(
-                    &fs::read(path)?,
-                    config.pkcs12_password.as_ref().unwrap(),
-                )
-                .with_context(|| "Failed to create identitiy")?;
+                let password = config
+                    .pkcs12_password
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Missing `tls.pkcs12_password`"))?;
+                let ident = Identity::from_pkcs12(&fs::read(path)?, password)
+                    .with_context(|| "Failed to create identity")?;
                 Some(TlsAcceptor::from(
-                    native_tls::TlsAcceptor::new(ident).unwrap(),
+                    native_tls::TlsAcceptor::new(ident)
+                        .with_context(|| "Failed to create the tls acceptor")?,
                 ))
             }
             None => None,
@@ -90,14 +92,22 @@ impl Transport for TlsTransport {
     }
 
     async fn handshake(&self, conn: Self::RawStream) -> Result<Self::Stream> {
-        let conn = self.tls_acceptor.as_ref().unwrap().accept(conn).await?;
+        let conn = self
+            .tls_acceptor
+            .as_ref()
+            .ok_or_else(|| anyhow!("Missing `tls.pkcs12` for running as a server"))?
+            .accept(conn)
+            .await?;
         Ok(conn)
     }
 
     async fn connect(&self, addr: &AddrMaybeCached) -> Result<Self::Stream> {
         let conn = self.tcp.connect(addr).await?;
 
-        let connector = self.connector.as_ref().unwrap();
+        let connector = self
+            .connector
+            .as_ref()
+            .ok_or_else(|| anyhow!("No tls client config available for running as a client"))?;
         Ok(connector
             .connect(
                 self.config

@@ -98,7 +98,7 @@ cargo check --target x86_64-unknown-linux-gnu --no-default-features --features e
 - **Package manager**: cargo only; lockfile committed. `[target.'cfg(windows)'.dependencies]` gates windows-service 0.8 / tracing-appender / windows-sys 0.61 (keep `Win32_System_Registry` — `SHELLEXECUTEINFOW` needs it).
 - **Deps rationale**: `toml_edit` (comment-preserving edits), `dialoguer` (TTY prompts only), `serde_json` (`--json` outputs), `atty` (color/TTY gating).
 - **Do not add**: native libgit2 (vergen git), a second TLS backend simultaneously, QUIC transports without feature-gating off by default (breaks `embedded`).
-- **Release**: push a tag → `release.yml` cross-builds 16 targets, drafts a GitHub Release; local helper `scripts/release.sh` uses `gh` (repo `rede97/rathole-x`).
+- **Release**: push a tag → `release.yml` builds the single `x86_64-pc-windows-msvc` target (the full cross-platform matrix was deliberately reduced; other targets can be restored once systemd support lands), drafts a GitHub Release; local helper `scripts/release.sh` uses `gh` (repo `rede97/rathole-x`).
 
 ## Service Lifecycle Facts
 

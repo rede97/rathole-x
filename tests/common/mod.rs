@@ -1,3 +1,7 @@
+// Shared helpers compiled into every integration test crate; not each
+// crate uses all of them, so silence per-crate dead_code warnings here.
+#![allow(dead_code)]
+
 use std::path::PathBuf;
 
 use anyhow::Result;

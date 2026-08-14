@@ -34,9 +34,14 @@ type ServiceDigest = protocol::Digest; // SHA256 of a service name
 type Nonce = protocol::Digest; // Also called `session_key`
 
 const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP servies
-const UDP_POOL_SIZE: usize = 2; // The number of cached connections for UDP services
+// The UDP pool consumes exactly one data channel (see run_udp_connection_pool),
+// so prefetch only one; a second channel would be created but never used
+const UDP_POOL_SIZE: usize = 1;
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
+// Timeout for the whole hello/auth phase of an incoming connection, so an
+// unauthenticated peer cannot hold the connection (and its fd) forever
+const HELLO_AUTH_TIMEOUT: u64 = 10;
 
 // The entrypoint of running a server
 pub async fn run_server(
@@ -253,24 +258,43 @@ async fn handle_connection<T: 'static + Transport>(
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     server_config: Arc<ServerConfig>,
 ) -> Result<()> {
-    // Read hello
-    let hello = read_hello(&mut conn).await?;
-    match hello {
-        ControlChannelHello(_, service_digest) => {
-            do_control_channel_handshake(
-                conn,
-                services,
-                control_channels,
-                service_digest,
-                server_config,
-            )
-            .await?;
+    // The hello/auth phase must complete within a deadline; otherwise an
+    // unauthenticated peer sending zero bytes could occupy the connection
+    // (and its fd) forever
+    let handshake = async {
+        // Read hello
+        let hello = read_hello(&mut conn).await?;
+        match hello {
+            ControlChannelHello(_, service_digest) => {
+                do_control_channel_handshake(
+                    conn,
+                    services,
+                    control_channels,
+                    service_digest,
+                    server_config,
+                )
+                .await?;
+            }
+            DataChannelHello(_, nonce) => {
+                do_data_channel_handshake(conn, control_channels, nonce).await?;
+            }
         }
-        DataChannelHello(_, nonce) => {
-            do_data_channel_handshake(conn, control_channels, nonce).await?;
-        }
-    }
+        Ok::<(), anyhow::Error>(())
+    };
+    time::timeout(Duration::from_secs(HELLO_AUTH_TIMEOUT), handshake)
+        .await
+        .with_context(|| "Hello/auth timed out")??;
     Ok(())
+}
+
+// Constant-time comparison of two digests. Comparing the session key with
+// `!=` would leak timing information about the expected value
+fn digest_eq(a: &protocol::Digest, b: &protocol::Digest) -> bool {
+    let mut acc = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        acc |= x ^ y;
+    }
+    acc == 0
 }
 
 async fn do_control_channel_handshake<T: 'static + Transport>(
@@ -308,7 +332,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     }
     .to_owned();
 
-    let service_name = &service_config.name;
+    let service_name = service_config.name.clone();
 
     // Calculate the checksum
     let mut concat = Vec::from(service_config.token.as_ref().unwrap().as_bytes());
@@ -319,16 +343,22 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
 
     // Validate
     let session_key = protocol::digest(&concat);
-    if session_key != d {
+    if !digest_eq(&session_key, &d) {
         conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
             .await?;
-        debug!(
-            "Expect {}, but got {}",
-            hex::encode(session_key),
-            hex::encode(d)
-        );
+        // Never log the session key: together with the nonce it allows
+        // offline brute-forcing a weak token
         bail!("Service {} failed the authentication", service_name);
     } else {
+        // Send the ack outside the write lock; the lock only guards the map
+        conn.write_all(&bincode::serialize(&Ack::Ok).unwrap())
+            .await?;
+        conn.flush().await?;
+
+        info!(service = %service_config.name, "Control channel established");
+        let handle =
+            ControlChannelHandle::new(conn, service_config, server_config.heartbeat_interval);
+
         let mut h = control_channels.write().await;
 
         // If there's already a control channel for the service, then drop the old one.
@@ -341,15 +371,6 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
                 service_name
             );
         }
-
-        // Send ack
-        conn.write_all(&bincode::serialize(&Ack::Ok).unwrap())
-            .await?;
-        conn.flush().await?;
-
-        info!(service = %service_config.name, "Control channel established");
-        let handle =
-            ControlChannelHandle::new(conn, service_config, server_config.heartbeat_interval);
 
         // Insert the new handle
         let _ = h.insert(service_digest, session_key, handle);
@@ -453,7 +474,7 @@ where
                         shutdown_rx_clone,
                     )
                     .await
-                    .with_context(|| "Failed to run TCP connection pool")
+                    .with_context(|| "Failed to run UDP connection pool")
                     {
                         error!("{:#}", e);
                     }
@@ -556,13 +577,17 @@ fn tcp_listen_and_send(
             Ok(TcpListener::bind(&addr).await?)
         }, |e, duration| {
             error!("{:#}. Retry in {:?}", e, duration);
-        }, &mut shutdown_rx).await
-        .with_context(|| "Failed to listen for the service");
+        }, &mut shutdown_rx).await;
 
         let l: TcpListener = match l {
-            Ok(v) => v,
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                // Shutdown while retrying; not an error
+                info!("Shutdown while listening");
+                return;
+            }
             Err(e) => {
-                error!("{:#}", e);
+                error!("{:#}", e.context("Failed to listen for the service"));
                 return;
             }
         };
@@ -637,7 +662,12 @@ async fn run_tcp_connection_pool<T: Transport>(
             if let Some(mut ch) = data_ch_rx.recv().await {
                 if write_and_flush(&mut ch, &cmd).await.is_ok() {
                     tokio::spawn(async move {
-                        let _ = copy_bidirectional(&mut ch, &mut visitor).await;
+                        if let Err(e) = copy_bidirectional(&mut ch, &mut visitor).await {
+                            debug!(
+                                "Failed to forward TCP between the visitor and the data channel: {:#}",
+                                e
+                            );
+                        }
                     });
                     break;
                 } else {
@@ -660,12 +690,19 @@ async fn run_tcp_connection_pool<T: Transport>(
 async fn run_udp_connection_pool<T: Transport>(
     bind_addr: String,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
-    _data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     // TODO: Load balance
 
-    let l = retry_notify_with_deadline(
+    let cmd = bincode::serialize(&DataChannelCmd::StartForwardUdp).unwrap();
+    let mut buf = [0u8; UDP_BUFFER_SIZE];
+
+    // The socket is bound once for the pool's whole lifetime: per-datagram
+    // errors (ICMP-triggered WSAECONNRESET on Windows) are tolerated below,
+    // so only a dead data channel tears down a forwarding session — the
+    // socket, and with it the visitors' endpoint, survives the rebuild.
+    let l = match retry_notify_with_deadline(
         listen_backoff(),
         || async { Ok(UdpSocket::bind(&bind_addr).await?) },
         |e, duration| {
@@ -674,41 +711,119 @@ async fn run_udp_connection_pool<T: Transport>(
         &mut shutdown_rx,
     )
     .await
-    .with_context(|| "Failed to listen for the service")?;
+    {
+        Ok(Some(l)) => l,
+        Ok(None) => return Ok(()), // Shutdown while retrying; not an error
+        Err(e) => return Err(e.context("Failed to listen for the service")),
+    };
 
     info!("Listening at {}", &bind_addr);
 
-    let cmd = bincode::serialize(&DataChannelCmd::StartForwardUdp).unwrap();
-
-    // Receive one data channel
-    let mut conn = data_ch_rx
-        .recv()
-        .await
-        .ok_or_else(|| anyhow!("No available data channels"))?;
-    write_and_flush(&mut conn, &cmd).await?;
-
-    let mut buf = [0u8; UDP_BUFFER_SIZE];
-    loop {
-        tokio::select! {
-            // Forward inbound traffic to the client
-            val = l.recv_from(&mut buf) => {
-                let (n, from) = val?;
-                UdpTraffic::write_slice(&mut conn, from, &buf[..n]).await?;
-            },
-
-            // Forward outbound traffic from the client to the visitor
-            hdr_len = conn.read_u8() => {
-                let t = UdpTraffic::read(&mut conn, hdr_len?).await?;
-                l.send_to(&t.data, t.from).await?;
+    // Session loop: a broken data channel only tears down the current
+    // forwarding session. A fresh data channel is acquired and forwarding
+    // resumes, so a transient I/O error no longer kills the UDP service
+    // until the control channel is rebuilt. Only the shutdown signal or
+    // the control channel going away (closing `data_ch_rx` /
+    // `data_ch_req_tx`) ends the pool.
+    'pool: loop {
+        // Receive one data channel
+        let mut conn = match data_ch_rx.recv().await {
+            Some(conn) => conn,
+            // The control channel is gone. Nothing will feed us new data
+            // channels, so there is no point in retrying
+            None => break 'pool,
+        };
+        if let Err(e) = write_and_flush(&mut conn, &cmd).await {
+            warn!("Failed to start forwarding on a data channel: {:#}", e);
+            // Ask for a replacement channel and retry
+            if data_ch_req_tx.send(true).is_err() {
+                break 'pool;
             }
+            continue 'pool;
+        }
 
-            _ = shutdown_rx.recv() => {
-                break;
+        loop {
+            tokio::select! {
+                // Forward inbound traffic to the client
+                val = l.recv_from(&mut buf) => {
+                    match val {
+                        Ok((n, from)) => {
+                            if let Err(e) = UdpTraffic::write_slice(&mut conn, from, &buf[..n]).await {
+                                warn!("Failed to forward inbound traffic to the client: {:#}", e);
+                                break;
+                            }
+                        }
+                        // A UDP socket error is per-datagram and transient
+                        // (on Windows a single ICMP port unreachable turns
+                        // into WSAECONNRESET). Log and keep the session;
+                        // only a dead data channel justifies a rebuild.
+                        Err(e) => {
+                            warn!("Failed to receive inbound traffic (ignored): {:#}", e);
+                        }
+                    }
+                },
+
+                // Forward outbound traffic from the client to the visitor
+                hdr_len = conn.read_u8() => {
+                    let hdr_len = match hdr_len {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!("Failed to read from the data channel: {:#}", e);
+                            break;
+                        }
+                    };
+                    match UdpTraffic::read(&mut conn, hdr_len).await {
+                        Ok(t) => {
+                            if let Err(e) = l.send_to(&t.data, t.from).await {
+                                // Per-datagram transient, see above
+                                warn!("Failed to forward outbound traffic to the visitor (ignored): {:#}", e);
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Failed to read outbound traffic from the data channel: {:#}", e);
+                            break;
+                        }
+                    }
+                }
+
+                _ = shutdown_rx.recv() => {
+                    break 'pool;
+                }
             }
+        }
+
+        // The forwarding session is broken. Ask the client for a
+        // replacement data channel and resume on the same socket
+        if data_ch_req_tx.send(true).is_err() {
+            break 'pool;
         }
     }
 
     debug!("UDP pool dropped");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn digest_eq_matches_identical_digests() {
+        let a = protocol::digest(b"token-and-nonce");
+        assert!(digest_eq(&a, &a));
+
+        let zero = [0u8; HASH_WIDTH_IN_BYTES];
+        assert!(digest_eq(&zero, &zero));
+    }
+
+    #[test]
+    fn digest_eq_rejects_a_difference_in_any_byte() {
+        let a = protocol::digest(b"token-and-nonce");
+        for i in 0..HASH_WIDTH_IN_BYTES {
+            let mut b = a;
+            b[i] ^= 0xff;
+            assert!(!digest_eq(&a, &b), "difference at byte {} must fail", i);
+        }
+    }
 }

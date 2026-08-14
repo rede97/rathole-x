@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_http_proxy::{http_connect_tokio, http_connect_tokio_with_basic_auth};
 use backoff::{backoff::Backoff, Notify};
 use socket2::{SockRef, TcpKeepalive};
@@ -59,7 +59,9 @@ pub async fn to_socket_addr<A: ToSocketAddrs>(addr: A) -> Result<SocketAddr> {
 }
 
 pub fn host_port_pair(s: &str) -> Result<(&str, u16)> {
-    let semi = s.rfind(':').expect("missing semicolon");
+    let semi = s
+        .rfind(':')
+        .ok_or_else(|| anyhow!("Missing `:` in the address `{}`", s))?;
     Ok((&s[..semi], s[semi + 1..].parse()?))
 }
 
@@ -102,7 +104,6 @@ pub async fn udp_connect<A: ToSocketAddrs>(addr: A, prefer_ipv6: bool) -> Result
     };
     let s = UdpSocket::bind(bind_addr).await?;
     s.connect(socket_addr).await?;
-    s.connect(socket_addr).await?;
     Ok(s)
 }
 
@@ -114,11 +115,13 @@ pub async fn tcp_connect_with_proxy(
 ) -> Result<TcpStream> {
     if let Some(url) = proxy {
         let addr = &addr.addr;
-        let mut s = TcpStream::connect((
-            url.host_str().expect("proxy url should have host field"),
-            url.port().expect("proxy url should have port field"),
-        ))
-        .await?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow!("The proxy url should have a host field"))?;
+        let port = url
+            .port()
+            .ok_or_else(|| anyhow!("The proxy url should have a port field"))?;
+        let mut s = TcpStream::connect((host, port)).await?;
 
         let auth = if !url.username().is_empty() || url.password().is_some() {
             Some(async_socks5::Auth {
@@ -148,7 +151,7 @@ pub async fn tcp_connect_with_proxy(
                     None => http_connect_tokio(&mut s, host, port).await?,
                 }
             }
-            _ => panic!("unknown proxy scheme"),
+            scheme => bail!("Unknown proxy scheme `{}`", scheme),
         }
         Ok(s)
     } else {
@@ -160,12 +163,14 @@ pub async fn tcp_connect_with_proxy(
 }
 
 // Wrapper of retry_notify
+// Returns `Ok(None)` when the deadline (shutdown signal) fires first, so
+// callers can tell a graceful shutdown apart from a real failure.
 pub async fn retry_notify_with_deadline<I, E, Fn, Fut, B, N>(
     backoff: B,
     operation: Fn,
     notify: N,
     deadline: &mut broadcast::Receiver<bool>,
-) -> Result<I>
+) -> Result<Option<I>>
 where
     E: std::error::Error + Send + Sync + 'static,
     B: Backoff,
@@ -175,10 +180,10 @@ where
 {
     tokio::select! {
         v = backoff::future::retry_notify(backoff, operation, notify) => {
-            v.map_err(anyhow::Error::new)
+            v.map(Some).map_err(anyhow::Error::new)
         }
         _ = deadline.recv() => {
-            Err(anyhow!("shutdown"))
+            Ok(None)
         }
     }
 }

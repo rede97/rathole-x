@@ -32,14 +32,14 @@ rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://g
 - **子命令驱动的 CLI** — `run`（运行守护进程）、`config add|remove|list|set`（管理服务配置）、`status`（服务状态 + 配置树）、`genkey`（生成 noise 密钥对）、`service install|uninstall|start|stop|restart`（系统服务生命周期）、`upgrade`（更新已安装二进制）。各 flag 见 [CLI reference](#cli-reference)。
 - **双模式（仅守护进程）** — `run` 在配置同时含两段时单进程运行 server 与 client；已安装的系统服务严格单角色，双角色需求通过安装两个服务实现。
 - **自动生成 token 与 noise 密钥** — `config add`/`config set` 在省略时自动生成。
-- **原子写入热重载** — `config add`/`config set`/`config remove` 原子重写配置；运行中的服务无需重启即热重载；配置无效时进程休眠等待恢复。
+- **原子写入热重载** — `config add`/`config set`/`config remove` 原子重写配置；运行中的服务无需重启即热重载。
 - **Windows 服务安装** — `service install server|client --name <n>` 注册一个命名 SCM 服务（AutoStart，SCM 名称为 `rathole-x-<role>-<N>`），拥有各自独立的配置文件；二进制被复制到配置旁，非管理员不可替换；每个服务写入一个 `uninstall-<n>.bat`；是否允许非管理员编辑配置由实际权限决定（无策略文件）。
 - **状态树视图** — `status` 打印服务状态 + 配置树（无参数列出全部服务，`--name N` 查看单服务，`--json` 供脚本使用）。
 - **角色骨架自动创建** — `service install` 在缺失时创建角色专属的骨架配置。
 
 ## Quick start (Windows)
 
-1. 从已提权的 shell 安装服务。`--yes` 为必填：缺少它只会打印用法。若缺少默认配置则自动创建统一的空默认配置，二进制被复制到配置旁，并以 UAC 提权注册一个 Windows SCM 服务（AutoStart）：
+1. 从已提权的 shell 安装服务。`--yes` 为必填：缺少它只会打印用法。若缺少配置文件则自动创建角色专属的骨架配置，二进制被复制到配置旁，并以 UAC 提权注册一个 Windows SCM 服务（AutoStart）：
 
 ```bash
 # 服务端（公网 IP）
@@ -120,11 +120,9 @@ Reinstall the service to upgrade: `rathole-x service uninstall --yes` then `rath
 # 脚本可传入所有 flag 并通过 --json 读取机器可读输出。
 ./rathole-x config add --client "server:myserver.com:2333;name:my_nas_ssh;local:127.0.0.1:22" --json
 
-# 命名服务端档案（CLI 语法糖；在写入时解析为具体地址，
-# 因此配置文件保持与上游兼容）：
-./rathole-x config add --remote "name:default;server:srv-a.com:2333" --remote "name:backup;server:srv-b.com:2333" \
-  --client "remote:default;name:nas;local:127.0.0.1:22" \
-  --client "remote:backup;name:db;local:127.0.0.1:5432"
+# 为同一台服务器批量添加多个服务（一次写入）
+./rathole-x config add --client "server:srv-a.com:2333;name:nas;local:127.0.0.1:22" \
+  --client "server:srv-a.com:2333;name:db;local:127.0.0.1:5432"
 
 # 生成 noise 密钥对（替代已移除的 --genkey flag）
 ./rathole-x genkey
@@ -151,7 +149,7 @@ Reinstall the service to upgrade: `rathole-x service uninstall --yes` then `rath
 `config add|remove|list|set` 与 `status` 接受 `--json` 以获得机器可读输出；`service install`、`service uninstall` 与 `upgrade` 需要 `--yes` 来确认。上游的位置参数形式 `./rathole config.toml` 在本分支中**不受支持**——用 `run -c CONFIG` 运行守护进程（不带 `-c` 时使用系统默认路径：Windows 为 `%ProgramData%\rathole-x\rathole-x.toml`，Linux 为 `/etc/rathole-x.toml`）。带 `--name` 的命令操作同名的已安装服务；同时省略 `--name` 与 `-c` 且恰好只安装了一个服务时，自动使用该服务。
 
 - `run [-c CONFIG] [--server|--client]` — 运行守护进程；`--server`/`--client` 强制指定模式。双段配置在单进程中同时运行两段。
-- `config add [<NAME>] [--client SPEC]... [--server SPEC]... [--remote-addr A] [--bind-addr A] [--local-addr A] [--token T] [--noise] [--noise-key K] [--type tcp|udp] [-c] [--name N] [--json] [--yes]` — 按名称和 flag 添加服务，或通过可重复的 `--client "server:...;name:...;local:...;token:...;type:..."` / `--server "name:...;bind:...;token:...;type:..."` 规格批量添加（一次写入、一次热重载）。在 TTY 中不指定名称时，会运行多轮交互式向导（空名称结束）。Client 规格接受 `server:` 键：在全新段上设置 [client] 默认值，否则作为按服务覆盖（一个 client 可连接多个服务器）。
+- `config add [<NAME>] [--client SPEC]... [--server SPEC]... [--remote-addr A] [--bind-addr A] [--local-addr A] [--token T] [--noise] [--noise-key K] [--type tcp|udp] [-c] [--name N] [--json] [--yes]` — 按名称和 flag 添加服务，或通过可重复的 `--client "server:...;name:...;local:...;token:...;type:..."` / `--server "name:...;bind:...;token:...;type:..."` 规格批量添加（一次写入、一次热重载）。在 TTY 中不指定名称时，会运行多轮交互式向导（空名称结束）。一个 client 配置只连接一个服务器（与上游一致）：规格的 `server:` 键在全新段上设置 `[client] remote_addr` 默认值；段已存在时必须与其一致——要使用另一台服务器，请安装独立的服务实例（`service install client --name <N>`）。
 - `config remove <NAME> [-c] [--name N] [--json]` — 移除服务。
 - `config list [-c] [--name N] [--json]` — 列出服务。
 - `config set <--client|--server> [global fields] [-c] [--name N] [--json]` — 设置全局字段：`--remote-addr`、`--bind-addr`、`--default-token`、`--prefer-ipv6`、`--heartbeat-timeout`、`--retry-interval`、`--heartbeat-interval`、`--transport tcp|tls|noise|websocket`、`--noise`、`--noise-key`、`--trusted-root`、`--hostname`、`--pkcs12`、`--pkcs12-password`、`--ws-tls`、`--nodelay`、`--keepalive-secs`、`--keepalive-interval`、`--proxy`。

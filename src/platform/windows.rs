@@ -152,6 +152,57 @@ fn quote_arg(arg: &str) -> String {
     out
 }
 
+/// Remove any `--elevated-log <path>` pair from `args` so a relay never
+/// forwards a stale log path from the original argv before appending its own.
+fn strip_elevated_log(args: &[OsString]) -> Vec<OsString> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut iter = args.iter();
+    while let Some(a) = iter.next() {
+        if a.as_os_str() == OsStr::new("--elevated-log") {
+            // Drop the flag and its value.
+            let _ = iter.next();
+            continue;
+        }
+        out.push(a.clone());
+    }
+    out
+}
+
+/// Pick a free, unpredictable temp log path for the elevation relay.
+/// `create_new` never follows a pre-planted file or reparse point; a
+/// collision retries with a fresh random name. The reserved file is removed
+/// again so the elevated child can re-create it with `create_new` too (see
+/// [`redirect_stdio_to_file`]).
+fn pick_elevated_log_path() -> Result<PathBuf> {
+    for attempt in 0..8u32 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let candidate = std::env::temp_dir().join(format!(
+            "rathole-x-elev-{}-{}-{}.log",
+            std::process::id(),
+            nanos,
+            attempt
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&candidate);
+                return Ok(candidate);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(anyhow!(e)).context("failed to create the elevation log file")
+            }
+        }
+    }
+    bail!("failed to pick a free elevation log path after 8 attempts");
+}
+
 /// Relaunch the current executable with `args` under UAC elevation, hidden,
 /// wait for it to finish, and replay its output in this process.
 ///
@@ -159,24 +210,17 @@ fn quote_arg(arg: &str) -> String {
 /// `--elevated-log` flag handled in main.rs) so nothing shows up in a
 /// separate console window. Returns the child's output on success; errors on
 /// a cancelled UAC prompt or a failing child.
-pub fn relaunch_elevated_wait(args: &[String]) -> Result<String> {
+pub fn relaunch_elevated_wait(args: &[OsString]) -> Result<String> {
     let exe = std::env::current_exe().context("failed to resolve current executable path")?;
 
-    let log_path = std::env::temp_dir().join(format!(
-        "rathole-x-elev-{}-{}.log",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+    let log_path = pick_elevated_log_path()?;
 
-    let mut params: Vec<String> = args.to_vec();
-    params.push("--elevated-log".to_owned());
-    params.push(log_path.to_string_lossy().into_owned());
+    let mut params: Vec<OsString> = strip_elevated_log(args);
+    params.push(OsString::from("--elevated-log"));
+    params.push(log_path.as_os_str().to_os_string());
     let params = params
         .iter()
-        .map(|a| quote_arg(a))
+        .map(|a| quote_arg(&a.to_string_lossy()))
         .collect::<Vec<_>>()
         .join(" ");
 
@@ -207,9 +251,28 @@ pub fn relaunch_elevated_wait(args: &[String]) -> Result<String> {
     // SAFETY: `hProcess` is a valid process handle from ShellExecuteExW when
     // SEE_MASK_NOCLOSEPROCESS is set.
     let exit_code = unsafe {
-        WaitForSingleObject(info.hProcess, INFINITE);
+        // WAIT_OBJECT_0 (0) is the only success state for a process wait;
+        // WAIT_FAILED (0xFFFFFFFF) and abandoned states must not be treated
+        // as a successful elevated run.
+        let waited = WaitForSingleObject(info.hProcess, INFINITE);
+        if waited != 0 {
+            let err = std::io::Error::last_os_error();
+            CloseHandle(info.hProcess);
+            return Err(anyhow!(
+                "failed waiting on the elevated process (WaitForSingleObject returned {}: {})",
+                waited,
+                err
+            ));
+        }
         let mut code: u32 = 0;
-        GetExitCodeProcess(info.hProcess, &mut code);
+        if GetExitCodeProcess(info.hProcess, &mut code) == 0 {
+            let err = std::io::Error::last_os_error();
+            CloseHandle(info.hProcess);
+            return Err(anyhow!(
+                "failed to read the elevated process exit code: {}",
+                err
+            ));
+        }
         CloseHandle(info.hProcess);
         code
     };
@@ -239,17 +302,96 @@ fn launch_arguments(config_path: &Path) -> Vec<OsString> {
     ]
 }
 
+/// Build the icacls invocations that lock down the service config directory,
+/// the installed binary and the config file to Administrators + SYSTEM,
+/// regardless of who pre-created the directory (the pre-elevation CLI runs
+/// as a normal user, leaving CREATOR OWNER full control otherwise).
+///
+/// Layout: one `/reset` per path (drops any pre-existing explicit ACEs),
+/// then `/inheritance:r` plus explicit grants. SIDs are locale-independent:
+/// S-1-5-32-544 = Administrators, S-1-18 = SYSTEM, S-1-5-32-545 = Users.
+///
+/// The config defaults to Administrators full control (elevated edits) and
+/// SYSTEM read (the service only reads it). With `allow_user_config` the
+/// directory additionally grants Users create-files (atomic write + rename)
+/// and the config grants Users modify — never read-for-everyone.
+fn lockdown_icacls_args(
+    dir: &Path,
+    exe: &Path,
+    config: &Path,
+    allow_user_config: bool,
+) -> Vec<Vec<OsString>> {
+    let admins_full = OsString::from("*S-1-5-32-544:F");
+    let mut cmds: Vec<Vec<OsString>> = Vec::new();
+
+    let mut lock = |path: &Path, grants: &[&OsStr]| {
+        cmds.push(vec![path.as_os_str().to_os_string(), OsString::from("/reset")]);
+        let mut cmd = vec![
+            path.as_os_str().to_os_string(),
+            OsString::from("/inheritance:r"),
+        ];
+        for grant in grants {
+            cmd.push(OsString::from("/grant"));
+            cmd.push(grant.to_os_string());
+        }
+        cmds.push(cmd);
+    };
+
+    let system_full = OsString::from("*S-1-18:F");
+    let system_read = OsString::from("*S-1-18:R");
+    let users_create = OsString::from("*S-1-5-32-545:WD");
+    let users_modify = OsString::from("*S-1-5-32-545:M");
+
+    let mut dir_grants: Vec<&OsStr> = vec![&admins_full, &system_full];
+    if allow_user_config {
+        dir_grants.push(&users_create);
+    }
+    lock(dir, &dir_grants);
+
+    lock(exe, &[&admins_full, &system_full]);
+
+    let mut config_grants: Vec<&OsStr> = vec![&admins_full, &system_read];
+    if allow_user_config {
+        config_grants.push(&users_modify);
+    }
+    lock(config, &config_grants);
+
+    cmds
+}
+
+/// Run one icacls invocation; failures are fatal: an install that cannot
+/// lock down its files must not proceed (LocalSystem escalation risk).
+fn run_icacls(args: &[OsString]) -> Result<()> {
+    let status = std::process::Command::new("icacls")
+        .args(args)
+        .status()
+        .context("failed to run icacls")?;
+    if !status.success() {
+        bail!(
+            "icacls failed (exit {}) on `{}`",
+            status,
+            Path::new(&args[0]).display()
+        );
+    }
+    Ok(())
+}
+
 /// Create and start a Windows service that runs
 /// `"<current_exe>" service run --config "<config_path>"` at boot.
-/// Also writes the `version.toml` policy and, when allowed, opens the config
-/// ACL to BUILTIN\Users.
+/// Also writes the `version.toml` policy and locks the config directory,
+/// binary and config down to Administrators + SYSTEM (plus Users write on
+/// the config only when `allow_user_config`).
 pub fn install(opts: &ServiceInstallOptions) -> Result<()> {
-    if let Some(parent) = opts.config_path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create config directory {}", parent.display())
-            })?;
-        }
+    let dir = opts
+        .config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).with_context(|| {
+            format!("failed to create config directory {}", dir.display())
+        })?;
     }
 
     // Write the version stamp. It deliberately has no CLI editor: changing it
@@ -265,48 +407,29 @@ pub fn install(opts: &ServiceInstallOptions) -> Result<()> {
     )
     .context("failed to write version.toml")?;
 
-    if opts.allow_user_config {
-        // Grant BUILTIN\Users the right to create files in the config
-        // directory (needed for the CLI's atomic write + rename) and modify
-        // rights on the config file itself. Deliberately NOT modify on the
-        // directory: the service binary lives there and must not be
-        // replaceable by non-admins (that would be LocalSystem code exec).
-        let dir = opts.config_path.parent().unwrap_or(Path::new("."));
-        let status = std::process::Command::new("icacls")
-            .arg(dir)
-            .arg("/grant")
-            .arg("*S-1-5-32-545:WD")
-            .status()
-            .context("failed to run icacls on the config directory")?;
-        if !status.success() {
-            bail!("icacls failed granting Users create rights on {}", dir.display());
-        }
-        let status = std::process::Command::new("icacls")
-            .arg(&opts.config_path)
-            .arg("/grant")
-            .arg("*S-1-5-32-545:M")
-            .status()
-            .context("failed to run icacls on the config file")?;
-        if !status.success() {
-            bail!(
-                "icacls failed granting Users modify on {}",
-                opts.config_path.display()
-            );
-        }
-    }
-
     // Self-install the binary next to the config so the service keeps a
     // stable path even when the user moves or deletes the original file.
     let exe = std::env::current_exe().context("failed to resolve current executable path")?;
     let exe_name = exe
         .file_name()
         .ok_or_else(|| anyhow!("current executable has no file name"))?;
-    let installed_exe = opts
-        .config_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join(exe_name);
+    let installed_exe = dir.join(exe_name);
     ensure_binary_copy(&exe, &installed_exe)?;
+
+    // Lock down the directory, the service binary and the config BEFORE the
+    // service is registered: the directory may have been pre-created by the
+    // un-elevated CLI (CREATOR OWNER = the installing user) or `--config`
+    // may point at any user-writable directory; either way a LocalSystem
+    // service must never run a binary or read secrets from a location a
+    // normal user can replace or read.
+    for args in lockdown_icacls_args(
+        &dir,
+        &installed_exe,
+        &opts.config_path,
+        opts.allow_user_config,
+    ) {
+        run_icacls(&args)?;
+    }
 
     let manager = ServiceManager::local_computer(
         None::<&str>,
@@ -331,7 +454,8 @@ pub fn install(opts: &ServiceInstallOptions) -> Result<()> {
     let service = manager
         .create_service(
             &service_info,
-            ServiceAccess::QUERY_STATUS | ServiceAccess::START,
+            // DELETE is needed for the rollback path when start() fails.
+            ServiceAccess::QUERY_STATUS | ServiceAccess::START | ServiceAccess::DELETE,
         )
         .map_err(|e| match e {
             ServiceError::Winapi(io_err)
@@ -345,9 +469,20 @@ pub fn install(opts: &ServiceInstallOptions) -> Result<()> {
             other => anyhow!(other)
                 .context(format!("failed to create service '{}'", service_name)),
         })?;
-    service
-        .start::<&OsStr>(&[])
-        .with_context(|| format!("failed to start service '{}'", service_name))?;
+    if let Err(e) = service.start::<&OsStr>(&[]) {
+        // Best-effort rollback: leaving the registration behind would make a
+        // retry fail with ERROR_SERVICE_EXISTS (half-installed state).
+        return match service.delete() {
+            Ok(()) => Err(anyhow!(e)).context(format!(
+                "failed to start service '{}'; rolled back its SCM registration",
+                service_name
+            )),
+            Err(de) => Err(anyhow!(e)).context(format!(
+                "failed to start service '{}' (and failed to roll back the registration: {}); run `rathole-x service uninstall --yes --name {}` before retrying",
+                service_name, de, opts.name
+            )),
+        };
+    }
 
     write_uninstall_bat(&installed_exe, &opts.config_path, &opts.name, opts.role);
 
@@ -361,20 +496,40 @@ pub fn install(opts: &ServiceInstallOptions) -> Result<()> {
 }
 
 /// Copy `source` to `dest` unless they are the same file (reinstalling from
-/// the installed location). Overwrites a stale copy.
+/// the installed location). Overwrites a stale copy. The copy lands in a
+/// sibling temp file first and is then renamed over `dest`, so a failed copy
+/// never leaves a truncated binary behind.
 fn ensure_binary_copy(source: &Path, dest: &Path) -> Result<()> {
-    if source == dest {
+    // Compare canonical paths so aliases (`dir/./x.exe`, 8.3 names, symlinks
+    // to the same file) are also recognized as "same file".
+    let same = match (source.canonicalize(), dest.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => source == dest,
+    };
+    if same {
         return Ok(());
     }
-    std::fs::copy(source, dest).with_context(|| {
+    let file_name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "rathole-x.exe".to_owned());
+    let tmp = dest.with_file_name(format!("{}.tmp{}", file_name, std::process::id()));
+    let copy_err = match std::fs::copy(source, &tmp) {
+        Ok(_) => match std::fs::rename(&tmp, dest) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        },
+        Err(e) => e,
+    };
+    let _ = std::fs::remove_file(&tmp);
+    Err(anyhow!(copy_err)).with_context(|| {
         format!(
             "failed to copy {} to {} (is the service running from {}? run `rathole-x service uninstall --yes` first)",
             source.display(),
             dest.display(),
             dest.display()
         )
-    })?;
-    Ok(())
+    })
 }
 
 /// Write an `uninstall-<name>.bat` next to the installed binary so the
@@ -547,8 +702,31 @@ pub fn uninstall(config_path: &Path, purge: bool) -> Result<()> {
 
 /// Remove the service-managed files. The config file and stale atomic-write
 /// temp files only when `purge` is set; version.toml when no other service
-/// config remains in the directory. Errors are logged, never fatal: the
+/// config remains in the directory; the per-service uninstall helper bat
+/// always (the service is gone). Errors are logged, never fatal: the SCM
+/// registration is already deleted when this runs.
 fn remove_service_files(config_path: &Path, purge: bool) {
+    // Bare relative paths (`-c x.toml`) have an empty parent: fall back to
+    // the current directory so temp-file cleanup and the version.toml
+    // last-service check still run.
+    let dir = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+
+    // The per-service uninstall helper bat is useless once the service is
+    // gone; delete it rather than leaving a user-modifiable script behind.
+    let stem = config_path
+        .file_stem()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let bat = dir.join(format!("uninstall-{}.bat", stem));
+    match std::fs::remove_file(&bat) {
+        Ok(()) => info!("removed helper script {}", bat.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!("failed to remove {}: {}", bat.display(), e),
+    }
+
     if purge {
         match std::fs::remove_file(config_path) {
             Ok(()) => info!("removed config {}", config_path.display()),
@@ -556,18 +734,14 @@ fn remove_service_files(config_path: &Path, purge: bool) {
             Err(e) => warn!("failed to remove {}: {}", config_path.display(), e),
         }
 
-        // Stale temp files from interrupted atomic writes (config.tmp<pid>)
-        if let Some(parent) = config_path.parent() {
-            let stem = config_path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            if let Ok(entries) = std::fs::read_dir(parent) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if name.starts_with(&format!("{}.tmp", stem)) {
-                        let _ = std::fs::remove_file(entry.path());
-                    }
+        // Stale temp files from interrupted atomic writes. write_atomic
+        // names them `<stem>.tmp<pid>` (with_extension replaces the `.toml`
+        // extension), so match on the file stem, not the full file name.
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(&format!("{}.tmp", stem)) {
+                    let _ = std::fs::remove_file(entry.path());
                 }
             }
         }
@@ -575,12 +749,11 @@ fn remove_service_files(config_path: &Path, purge: bool) {
 
     // version.toml goes with the last service: remove it when no OTHER
     // service config remains in the directory.
-    let dir = config_path.parent().unwrap_or(Path::new("."));
     let others_remain = std::fs::read_dir(dir)
         .map(|entries| {
             entries.flatten().any(|e| {
                 let p = e.path();
-                p != config_path
+                p.file_name() != config_path.file_name()
                     && p.file_stem().and_then(|s| s.to_str()) != Some("version")
                     && p.extension().and_then(|x| x.to_str()) == Some("toml")
             })
@@ -810,7 +983,7 @@ pub fn install_service(
 
     if !is_elevated() {
         println!("Requesting administrator rights (UAC)...");
-        let _ = relaunch_elevated_wait(&std::env::args().skip(1).collect::<Vec<_>>())?;
+        let _ = relaunch_elevated_wait(&std::env::args_os().skip(1).collect::<Vec<_>>())?;
         println!("Service '{}' installed and started", service_name);
         println!(
             "Run `rathole-x status --name {}` to inspect, `rathole-x config add --name {} ...` to configure (hot-reloaded).",
@@ -873,14 +1046,23 @@ pub fn uninstall_service(args: &UninstallArgs, config_path: &Path) -> Result<()>
     if !exists {
         // Service already gone: clean the files directly, no UAC needed.
         println!("Service '{}' is not installed; removing leftover files without elevation.", name);
-        remove_service_files(config_path, true);
-        println!("Done. Leftover files removed.");
+        remove_service_files(config_path, args.purge);
+        // Best effort, matching the elevated path: a kept config should stay
+        // readable/deletable by the user (fails silently without rights).
+        if !args.purge {
+            grant_users_modify(config_path);
+        }
+        if args.purge {
+            println!("Done. Leftover files and the config removed.");
+        } else {
+            println!("Done. Leftover files removed; config kept.");
+        }
         return Ok(());
     }
 
     if !is_elevated() {
         println!("Requesting administrator rights (UAC)...");
-        let _ = relaunch_elevated_wait(&std::env::args().skip(1).collect::<Vec<_>>())?;
+        let _ = relaunch_elevated_wait(&std::env::args_os().skip(1).collect::<Vec<_>>())?;
         println!("Service '{}' stopped and removed", name);
         if args.purge {
             println!("  Config:      removed ({})", config_path.display());
@@ -891,10 +1073,12 @@ pub fn uninstall_service(args: &UninstallArgs, config_path: &Path) -> Result<()>
     }
 
     uninstall(config_path, args.purge)?;
-    // Leave the kept config user-deletable after a normal uninstall.
+    // Leave the kept config user-deletable after a normal uninstall. The
+    // helper bat was already deleted by remove_service_files: granting
+    // Users modify on it would leave a "run as administrator" script a
+    // standard user could rewrite.
     if !args.purge {
         grant_users_modify(config_path);
-        grant_users_modify(&config_path.with_file_name(format!("uninstall-{}.bat", name)));
     }
     println!("Service '{}' stopped and removed", name);
     if args.purge {
@@ -916,16 +1100,23 @@ pub fn uninstall_all(_args: &UninstallArgs) -> Result<()> {
 
     if !is_elevated() {
         println!("Requesting administrator rights (UAC) to remove all services...");
-        let _ = relaunch_elevated_wait(&std::env::args().skip(1).collect::<Vec<_>>())?;
+        let _ = relaunch_elevated_wait(&std::env::args_os().skip(1).collect::<Vec<_>>())?;
         println!("All rathole-x services removed.");
         return Ok(());
     }
 
     let dir = crate::config_edit::config_dir();
     let mut removed = 0usize;
-    for (name, role) in &services {
+    for (name, _role) in &services {
         let path = dir.join(format!("{}.toml", name));
-        if service_exists(&scm_name(*role, name)) {
+        // The role parsed from the config may be stale (role section edited
+        // by hand after install): check BOTH role variants, otherwise the
+        // old-role service would be orphaned while its config is deleted.
+        let exists = service_exists(&scm_name(crate::config_edit::ServiceRole::Client, name))
+            || service_exists(&scm_name(crate::config_edit::ServiceRole::Server, name));
+        if exists {
+            // uninstall() itself also falls back to the other role when the
+            // primary SCM name does not open.
             uninstall(&path, true)?;
         } else {
             remove_service_files(&path, true);
@@ -997,7 +1188,7 @@ pub fn control_service(cmd: crate::cli::ServiceCmd) -> Result<()> {
 
     if !is_elevated() {
         println!("Requesting administrator rights (UAC)...");
-        let _ = relaunch_elevated_wait(&std::env::args().skip(1).collect::<Vec<_>>())?;
+        let _ = relaunch_elevated_wait(&std::env::args_os().skip(1).collect::<Vec<_>>())?;
         println!("Done: {} {}", action, names);
         return Ok(());
     }
@@ -1037,7 +1228,7 @@ pub fn control_service(cmd: crate::cli::ServiceCmd) -> Result<()> {
 pub fn upgrade_binary() -> Result<()> {
     if !is_elevated() {
         println!("Requesting administrator rights (UAC) to update the installed binary...");
-        let _ = relaunch_elevated_wait(&std::env::args().skip(1).collect::<Vec<_>>())?;
+        let _ = relaunch_elevated_wait(&std::env::args_os().skip(1).collect::<Vec<_>>())?;
         println!("Binary updated and services restarted.");
         return Ok(());
     }
@@ -1059,17 +1250,40 @@ pub fn upgrade_binary() -> Result<()> {
         }
     }
 
-    // Replace the shared binary.
+    // Replace the shared binary. On failure, best-effort restart the
+    // services we just stopped before returning the error, so a failed
+    // upgrade never leaves every service down.
     let exe = std::env::current_exe().context("failed to resolve current executable path")?;
     let exe_name = exe
         .file_name()
         .ok_or_else(|| anyhow!("current executable has no file name"))?;
     let installed = crate::config_edit::config_dir().join(exe_name);
-    ensure_binary_copy(&exe, &installed)?;
+    if let Err(e) = ensure_binary_copy(&exe, &installed) {
+        warn!("binary update failed: {:#}; restarting services best-effort", e);
+        let restarted = start_services_best_effort(&manager, &services);
+        warn!("restarted {} service(s) after the failed update", restarted);
+        return Err(e);
+    }
 
     // Start everything again.
+    let started = start_services_best_effort(&manager, &services);
+
+    println!(
+        "Updated {} and restarted {} service(s).",
+        installed.display(),
+        started
+    );
+    Ok(())
+}
+
+/// Start every listed service, logging failures without stopping. Returns
+/// the number of services successfully started.
+fn start_services_best_effort(
+    manager: &ServiceManager,
+    services: &[(String, crate::config_edit::ServiceRole)],
+) -> usize {
     let mut started = 0usize;
-    for (name, role) in &services {
+    for (name, role) in services {
         let scm = scm_name(*role, name);
         if let Ok(service) = manager.open_service(
             &scm,
@@ -1081,13 +1295,7 @@ pub fn upgrade_binary() -> Result<()> {
             }
         }
     }
-
-    println!(
-        "Updated {} and restarted {} service(s).",
-        installed.display(),
-        started
-    );
-    Ok(())
+    started
 }
 
 /// Whether a named SCM service exists (read-only query, no admin needed).
@@ -1157,7 +1365,7 @@ pub fn elevate_for_config_if_needed(path: &Path) -> Result<bool> {
     if !crate::config_edit::writable_by_current_user(path) && !is_elevated() {
         println!("Requesting administrator rights (UAC) to modify the service config...");
         let output =
-            relaunch_elevated_wait(&std::env::args().skip(1).collect::<Vec<_>>())?;
+            relaunch_elevated_wait(&std::env::args_os().skip(1).collect::<Vec<_>>())?;
         print!("{}", output);
         return Ok(true);
     }
@@ -1166,12 +1374,44 @@ pub fn elevate_for_config_if_needed(path: &Path) -> Result<bool> {
 
 /// Redirect stdout and stderr of this process to `path`. Must run before any
 /// output happens: Rust's stdio fetches the OS handle lazily on first use.
+///
+/// The file is opened with `create_new` semantics so a pre-planted file or
+/// reparse point at the (predictable-ish) relay path is never followed; on a
+/// collision a fresh random suffix is tried. When every attempt fails the
+/// process keeps its original stdio (the parent then just replays nothing).
 pub fn redirect_stdio_to_file(path: &Path) {
     use std::io::Write;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
 
-    let Ok(file) = std::fs::File::create(path) else {
+    let mut candidate = path.to_path_buf();
+    let file = 'attempts: {
+        for attempt in 0..8u32 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(f) => break 'attempts f,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let nanos = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0);
+                    let stem = candidate
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "rathole-x-elev".to_owned());
+                    candidate = candidate.with_file_name(format!(
+                        "{}-{}-{}.log",
+                        stem,
+                        nanos,
+                        attempt
+                    ));
+                }
+                Err(_) => return,
+            }
+        }
         return;
     };
     let handle = file.as_raw_handle() as HANDLE;
@@ -1259,10 +1499,16 @@ mod tests {
         std::fs::create_dir_all(dir).unwrap();
         let config = dir.join("config.toml");
         let auth = dir.join("version.toml");
-        let tmp = dir.join("config.toml.tmp4242");
+        // write_atomic names its temp file `<stem>.tmp<pid>` (with_extension
+        // replaces the `.toml` extension); anything else is a fake name the
+        // cleanup must not rely on.
+        let tmp = dir.join("config.tmp4242");
+        // A name write_atomic never produces: must NOT be matched.
+        let decoy = dir.join("config.toml.tmp4242");
         std::fs::write(&config, "x").unwrap();
         std::fs::write(&auth, "y").unwrap();
         std::fs::write(&tmp, "z").unwrap();
+        std::fs::write(&decoy, "z").unwrap();
         config
     }
 
@@ -1277,7 +1523,7 @@ mod tests {
         assert!(config.exists(), "config kept without --purge");
         assert!(!dir.join("version.toml").exists(), "version.toml always removed");
         assert!(
-            dir.join("config.toml.tmp4242").exists(),
+            dir.join("config.tmp4242").exists(),
             "tmp files kept without --purge"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -1294,8 +1540,12 @@ mod tests {
         assert!(!config.exists(), "config removed with --purge");
         assert!(!dir.join("version.toml").exists());
         assert!(
-            !dir.join("config.toml.tmp4242").exists(),
-            "stale tmp files removed with --purge"
+            !dir.join("config.tmp4242").exists(),
+            "stale write_atomic tmp files removed with --purge"
+        );
+        assert!(
+            dir.join("config.toml.tmp4242").exists(),
+            "names write_atomic never produces are left alone"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1311,5 +1561,130 @@ mod tests {
         remove_service_files(&dir.join("config.toml"), true);
         assert!(!auth.exists(), "version.toml removed with the last service");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn uninstall_removes_helper_bat_even_when_keeping_config() {
+        let dir = std::env::temp_dir().join("rathole-x-uninstall-bat");
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = setup(&dir);
+        let bat = dir.join("uninstall-config.bat");
+        std::fs::write(&bat, "@echo off").unwrap();
+
+        remove_service_files(&config, false);
+
+        assert!(!bat.exists(), "helper bat removed with the service");
+        assert!(config.exists(), "config kept without --purge");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn binary_copy_same_file_via_alias_is_noop() {
+        let dir = std::env::temp_dir().join("rathole-x-bin-alias");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("x.exe");
+        std::fs::write(&f, b"x").unwrap();
+
+        // Same file spelled with a `.` component: must be recognized as
+        // identical (canonicalized comparison) and left untouched.
+        let alias = dir.join(".").join("x.exe");
+        ensure_binary_copy(&alias, &f).unwrap();
+        assert_eq!(std::fs::read(&f).unwrap(), b"x");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn strip_elevated_log_removes_flag_and_value() {
+        let args: Vec<OsString> = ["service", "uninstall", "--elevated-log", r"C:\t\old.log", "--yes"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let stripped = strip_elevated_log(&args);
+        let plain: Vec<String> = stripped
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(plain, ["service", "uninstall", "--yes"]);
+
+        // A trailing flag without a value is dropped too.
+        let args: Vec<OsString> = ["status", "--elevated-log"].iter().map(OsString::from).collect();
+        assert_eq!(strip_elevated_log(&args).len(), 1);
+
+        // No flag: unchanged.
+        let args: Vec<OsString> = ["status", "--json"].iter().map(OsString::from).collect();
+        assert_eq!(strip_elevated_log(&args).len(), 2);
+    }
+
+    /// Concatenate one icacls invocation's arguments (after the target
+    /// path) into a single string for exact-match assertions.
+    fn cmd_string(cmd: &[OsString]) -> String {
+        cmd.iter()
+            .skip(1)
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn lockdown_args_restrict_dir_exe_and_config() {
+        let dir = Path::new(r"C:\cfg");
+        let exe = Path::new(r"C:\cfg\rathole-x.exe");
+        let config = Path::new(r"C:\cfg\config.toml");
+        let cmds = lockdown_icacls_args(dir, exe, config, false);
+
+        // Two invocations per path: /reset, then /inheritance:r + grants.
+        assert_eq!(cmds.len(), 6);
+        assert_eq!(cmds[0][0].as_os_str(), dir.as_os_str());
+        assert_eq!(cmd_string(&cmds[0]), "/reset");
+        assert_eq!(
+            cmd_string(&cmds[1]),
+            "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-18:F"
+        );
+        assert_eq!(cmds[2][0].as_os_str(), exe.as_os_str());
+        assert_eq!(cmds[3][0].as_os_str(), exe.as_os_str());
+        assert_eq!(
+            cmd_string(&cmds[3]),
+            "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-18:F"
+        );
+        assert_eq!(cmds[4][0].as_os_str(), config.as_os_str());
+        // Config: SYSTEM only needs read; no Users access by default.
+        assert_eq!(
+            cmd_string(&cmds[5]),
+            "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-18:R"
+        );
+        for cmd in &cmds {
+            let s = cmd_string(cmd);
+            assert!(
+                !s.contains("S-1-5-32-545"),
+                "no Users grants without --allow-user-config: {}",
+                s
+            );
+        }
+    }
+
+    #[test]
+    fn lockdown_args_allow_user_config_grants_write_only() {
+        let dir = Path::new(r"C:\cfg");
+        let exe = Path::new(r"C:\cfg\rathole-x.exe");
+        let config = Path::new(r"C:\cfg\config.toml");
+        let cmds = lockdown_icacls_args(dir, exe, config, true);
+
+        assert_eq!(cmds.len(), 6);
+        // Directory: Users may create files (atomic write + rename)...
+        assert_eq!(
+            cmd_string(&cmds[1]),
+            "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-18:F /grant *S-1-5-32-545:WD"
+        );
+        // ...the binary is never user-writable (LocalSystem escalation)...
+        assert_eq!(
+            cmd_string(&cmds[3]),
+            "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-18:F"
+        );
+        // ...and the config gets Users modify (write), never world-read.
+        assert_eq!(
+            cmd_string(&cmds[5]),
+            "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-18:R /grant *S-1-5-32-545:M"
+        );
     }
 }

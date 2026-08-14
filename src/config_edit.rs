@@ -15,7 +15,7 @@ use crate::cli::{
 
 const DEFAULT_SERVER_BIND_ADDR: &str = "0.0.0.0:2333";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ServiceSide {
     Client,
     Server,
@@ -36,8 +36,11 @@ pub struct ServiceInfo {
     pub json: Value,
 }
 
-/// Write a fully commented configuration template if `path` does not exist.
-/// Returns `true` when the file was created.
+/// Ensure the parent directory of `path` exists and report whether the
+/// config file itself is missing. Nothing is written here: callers start
+/// from an empty document for a new file and write `CONFIG_SKELETON` +
+/// document in a single `write_atomic` call (see `save_with_skeleton`), so
+/// the watcher never observes a partially written intermediate file.
 pub fn ensure_config_skeleton(path: &Path) -> Result<bool> {
     if path.exists() {
         return Ok(false);
@@ -50,40 +53,7 @@ pub fn ensure_config_skeleton(path: &Path) -> Result<bool> {
         }
     }
 
-    std::fs::write(path, CONFIG_SKELETON)
-        .with_context(|| format!("Failed to write {}", path.display()))?;
     Ok(true)
-}
-
-/// Insert `entry` as `<side>.services.<name>` in the configuration file,
-/// creating the file and the `[client]`/`[server]` section when absent.
-/// Errors when a service with the same name already exists on either side.
-pub fn add_service(path: &Path, side: ServiceSide, name: &str, entry: Item) -> Result<()> {
-    ensure_config_skeleton(path)?;
-    let mut doc = load_document(path)?;
-
-    if service_exists(&doc, side, name) {
-        bail!("A service named '{}' already exists in {}", name, path.display());
-    }
-
-    let section_key = side.key();
-    if doc.get(section_key).is_none() {
-        doc[section_key] = Item::Table(Table::new());
-    }
-    let section = doc[section_key]
-        .as_table_like_mut()
-        .ok_or_else(|| anyhow!("[{}] is not a table in {}", section_key, path.display()))?;
-    if section.get("services").is_none() {
-        section.insert("services", Item::Table(Table::new()));
-    }
-    let services = section
-        .get_mut("services")
-        .and_then(Item::as_table_like_mut)
-        .ok_or_else(|| anyhow!("[{}.services] is not a table in {}", section_key, path.display()))?;
-
-    services.insert(name, entry);
-
-    save_document(path, &doc)
 }
 
 /// Remove the service `name` from whichever side defines it.
@@ -160,7 +130,13 @@ pub fn run_list(args: &ListArgs, path: &Path) -> Result<()> {
         println!("{} service '{}':", s.side.key(), s.name);
         if let Value::Object(map) = &s.json {
             for (k, v) in map {
-                println!("  {} = {}", k, Value::to_string(v));
+                // Secrets are masked in human output (like batch's `••••`);
+                // --json above stays plaintext for machine consumers
+                if is_sensitive_key(k) && v.is_string() {
+                    println!("  {} = \"••••\"", k);
+                } else {
+                    println!("  {} = {}", k, Value::to_string(v));
+                }
             }
         }
         println!();
@@ -367,7 +343,9 @@ pub fn ensure_role_config(path: &Path, role: ServiceRole) -> Result<bool> {
     if path.exists() {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file {}", path.display()))?;
-        let _: crate::config::Config = toml::from_str(&content).with_context(|| {
+        // Full runtime validation, not just serde parsing: a config missing
+        // tokens/pkcs12 must fail here, not at service start
+        crate::config::Config::validate(&content).with_context(|| {
             format!(
                 "Config file {} is not a valid rathole-x configuration",
                 path.display()
@@ -402,13 +380,18 @@ fn write_atomic(path: &Path, content: &str) -> Result<()> {
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     std::fs::write(&tmp, content)
         .with_context(|| format!("Failed to write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| {
-        format!(
-            "Failed to replace {} with {}",
-            path.display(),
-            tmp.display()
-        )
-    })
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // Never leave a temp file with plaintext secrets behind
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| {
+            format!(
+                "Failed to replace {} with {}",
+                path.display(),
+                tmp.display()
+            )
+        });
+    }
+    Ok(())
 }
 
 /// Version stamp for the service config, stored in `version.toml` next to
@@ -662,6 +645,12 @@ pub fn run_set(args: &SetArgs, path: &Path) -> Result<()> {
         if let Some(t) = args.transport.or(implied_type) {
             transport.insert("type", value(t.key()));
         }
+        // The schema has no serde default for `type`: a transport table
+        // created only for tcp sub-keys (--nodelay/--keepalive/--proxy)
+        // would otherwise fail validation. Preserve an existing type.
+        if transport.get("type").is_none() {
+            transport.insert("type", value("tcp"));
+        }
 
         if args.noise {
             let (private_key, public_key) = crate::generate_keypair(KeypairType::X25519)?;
@@ -716,6 +705,15 @@ pub fn run_set(args: &SetArgs, path: &Path) -> Result<()> {
             }
         }
     }
+
+    // Refuse to save a configuration the runtime loader would reject
+    // (missing token, tls without pkcs12, ...)
+    crate::config::Config::validate(&doc.to_string()).with_context(|| {
+        format!(
+            "Refusing to save an invalid configuration to {}",
+            path.display()
+        )
+    })?;
 
     // Save, prepending the skeleton when the file was just created
     if created {
@@ -842,13 +840,22 @@ fn run_add_single(args: &AddArgs, path: &Path) -> Result<()> {
     let mut missing: Vec<&'static str> = Vec::new();
 
     let remote_addr = if side == ServiceSide::Client {
-        match args.remote_addr.clone().or(existing_remote_addr) {
-            Some(a) => Some(a),
-            None if interactive => Some(prompt(
+        match (args.remote_addr.clone(), existing_remote_addr) {
+            // One client config connects to exactly one server, like
+            // upstream; a different server means a separate service instance
+            (Some(flag), Some(existing)) if flag != existing => bail!(
+                "this config already connects to `{}`; to use `{}`, install a separate \
+                 service instance: `service install client --name <name>`",
+                existing,
+                flag
+            ),
+            (Some(flag), _) => Some(flag),
+            (None, Some(existing)) => Some(existing),
+            (None, None) if interactive => Some(prompt(
                 "Remote address (server control channel, host:port)",
                 Some("127.0.0.1:2333"),
             )?),
-            None => {
+            (None, None) => {
                 missing.push("--remote-addr");
                 None
             }
@@ -946,11 +953,11 @@ fn run_add_single(args: &AddArgs, path: &Path) -> Result<()> {
         _ => NoisePlan::None,
     };
 
-    // Create the file (fully commented skeleton) and the section defaults
+    // Nothing has touched the disk yet. For a new file the document starts
+    // empty and the skeleton is prepended in the single atomic save at the
+    // end (a toml_edit round-trip would re-render a comment-only skeleton
+    // at the end of the document).
     let created = ensure_config_skeleton(path)?;
-    // When the file was just created it only contains comments, which a
-    // toml_edit round-trip would re-render at the end of the document.
-    // Start from an empty document and prepend the skeleton on save instead.
     let mut doc = if created {
         DocumentMut::new()
     } else {
@@ -958,6 +965,17 @@ fn run_add_single(args: &AddArgs, path: &Path) -> Result<()> {
     };
 
     ensure_role_allows(&doc, side)?;
+
+    // Reject a duplicate name before ANY write: a failed `add` must be
+    // side-effect free (no rotated noise key, no leftover section)
+    if service_exists(&doc, side, &name) {
+        bail!(
+            "a {} service named `{}` already exists in {}",
+            side.key(),
+            name,
+            path.display()
+        );
+    }
 
     let section_key = side.key();
     if doc.get(section_key).is_none() {
@@ -974,17 +992,16 @@ fn run_add_single(args: &AddArgs, path: &Path) -> Result<()> {
         }
         section.insert("services", Item::Table(Table::new()));
         doc[section_key] = Item::Table(section);
+    } else {
+        // A pre-existing section might lack the services table
+        let section = doc[section_key]
+            .as_table_like_mut()
+            .ok_or_else(|| anyhow!("[{}] is not a table in {}", section_key, path.display()))?;
+        if section.get("services").is_none() {
+            section.insert("services", Item::Table(Table::new()));
+        }
     }
     apply_noise_transport(&mut doc, path, &noise_plan)?;
-    if created {
-        write_atomic(
-            path,
-            &format!("{}\n{}", CONFIG_SKELETON, doc),
-        )
-        .with_context(|| format!("Failed to write {}", path.display()))?;
-    } else {
-        save_document(path, &doc)?;
-    }
 
     // The per-service entry. Only non-default keys are written; serde
     // defaults in config.rs cover the rest (heartbeat, nodelay, ...).
@@ -1002,9 +1019,17 @@ fn run_add_single(args: &AddArgs, path: &Path) -> Result<()> {
     }
     entry.insert("token", value(token.as_str()));
 
-    let entry = Item::Table(entry);
-    let service_json = item_to_json(&entry);
-    add_service(path, side, &name, entry)?;
+    let result = insert_pending(
+        &mut doc,
+        PendingService {
+            side,
+            name: name.clone(),
+            entry,
+            generated_token: generated_token.clone(),
+        },
+    )?;
+    let service_json = result["service"].clone();
+    save_with_skeleton(path, &doc, created)?;
 
     // Output
     let generated = build_generated(&generated_token, &noise_plan);
@@ -1029,7 +1054,6 @@ fn run_add_single(args: &AddArgs, path: &Path) -> Result<()> {
 struct ServiceSpec {
     name: String,
     remote_addr: Option<String>,
-    remote_name: Option<String>,
     local_addr: Option<String>,
     bind_addr: Option<String>,
     token: Option<String>,
@@ -1061,32 +1085,6 @@ fn ensure_role_allows(doc: &DocumentMut, requested: ServiceSide) -> Result<()> {
 }
 
 /// Parse a --remote profile spec: "name:<id>;server:<host:port>".
-fn parse_remote_spec(spec: &str) -> Result<(String, String)> {
-    let mut name = None;
-    let mut server = None;
-    for pair in spec.split(';') {
-        let pair = pair.trim();
-        if pair.is_empty() {
-            continue;
-        }
-        let (key, val) = pair
-            .split_once(':')
-            .ok_or_else(|| anyhow!("Invalid --remote SPEC entry '{}': expected key:value", pair))?;
-        let (key, val) = (key.trim(), val.trim());
-        match key {
-            "name" => name = Some(val.to_string()),
-            "server" => {
-                validate_host_port(val, "server")?;
-                server = Some(val.to_string());
-            }
-            other => bail!("Unknown key '{}' in --remote SPEC", other),
-        }
-    }
-    let name = name.ok_or_else(|| anyhow!("Missing 'name' in --remote SPEC '{}'", spec))?;
-    let server = server.ok_or_else(|| anyhow!("Missing 'server' in --remote SPEC '{}'", spec))?;
-    Ok((name, server))
-}
-
 /// Parse one compact spec: "key:value;key:value;...".
 /// Client keys: name, server, local, token, type.
 /// Server keys: name, bind, token, type.
@@ -1112,9 +1110,6 @@ fn parse_spec(spec: &str, side: ServiceSide) -> Result<ServiceSpec> {
             "server" if side == ServiceSide::Client => {
                 validate_host_port(val, "server")?;
                 out.remote_addr = Some(val.to_string());
-            }
-            "remote" if side == ServiceSide::Client => {
-                out.remote_name = Some(val.to_string());
             }
             "local" if side == ServiceSide::Client => {
                 validate_host_port(val, "local")?;
@@ -1150,49 +1145,42 @@ struct PendingService {
 /// Batch mode: every --client/--server SPEC becomes a service; the whole
 /// batch is written in one atomic save (one hot-reload cycle).
 fn run_add_batch(args: &AddArgs, path: &Path) -> Result<()> {
-    // Named server profiles from --remote "name:<id>;server:<addr>".
-    let mut profiles: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    for spec in &args.remote_specs {
-        let (name, server) = parse_remote_spec(spec)?;
-        if profiles.insert(name.clone(), server.clone()).is_some() {
-            bail!("Duplicate --remote profile '{}'", name);
-        }
-    }
-
     // Parse everything first: fail fast without touching the file.
+    // One client config connects to exactly one server (upstream model):
+    // every `server:` key in the batch must agree.
     let mut pending: Vec<PendingService> = Vec::new();
+    let mut batch_remote: Option<String> = None;
     for spec in &args.client_specs {
-        let mut s = parse_spec(spec, ServiceSide::Client)?;
-        if let Some(remote_name) = &s.remote_name {
-            if s.remote_addr.is_some() {
-                bail!(
-                    "SPEC '{}' uses both 'server:' and 'remote:'; use one",
-                    spec
-                );
+        let s = parse_spec(spec, ServiceSide::Client)?;
+        if let Some(addr) = &s.remote_addr {
+            match &batch_remote {
+                None => batch_remote = Some(addr.clone()),
+                Some(first) if first != addr => bail!(
+                    "conflicting servers `{}` and `{}` in one batch: one client config \
+                     connects to one server; use separate service instances for multiple servers",
+                    first,
+                    addr
+                ),
+                _ => {}
             }
-            let addr = profiles.get(remote_name).ok_or_else(|| {
-                anyhow!(
-                    "Unknown --remote profile '{}' in SPEC '{}' (defined: {})",
-                    remote_name,
-                    spec,
-                    if profiles.is_empty() {
-                        String::from("none")
-                    } else {
-                        profiles.keys().cloned().collect::<Vec<_>>().join(", ")
-                    }
-                )
-            })?;
-            s.remote_addr = Some(addr.clone());
         }
         pending.push(spec_to_pending(s, ServiceSide::Client)?);
-    }
-    if !profiles.is_empty() && args.client_specs.is_empty() {
-        bail!("--remote profiles require at least one --client SPEC that references them");
     }
     for spec in &args.server_specs {
         let s = parse_spec(spec, ServiceSide::Server)?;
         pending.push(spec_to_pending(s, ServiceSide::Server)?);
+    }
+
+    // Reject duplicate names inside the batch itself before touching the file
+    let mut seen = std::collections::HashSet::new();
+    for p in &pending {
+        if !seen.insert((p.side, p.name.as_str())) {
+            bail!(
+                "duplicate {} service `{}` in this batch",
+                p.side.key(),
+                p.name
+            );
+        }
     }
 
     let created = ensure_config_skeleton(path)?;
@@ -1208,6 +1196,18 @@ fn run_add_batch(args: &AddArgs, path: &Path) -> Result<()> {
         .and_then(Item::as_str)
         .map(str::to_string);
 
+    // The batch's server must match the one this config already connects to
+    if let (Some(existing), Some(want)) = (&section_remote, &batch_remote) {
+        if existing != want {
+            bail!(
+                "this config already connects to `{}`; to use `{}`, install a separate \
+                 service instance: `service install client --name <name>`",
+                existing,
+                want
+            );
+        }
+    }
+
     // Role gate: batch entries must match the config's declared role.
     if pending.iter().any(|p| p.side == ServiceSide::Client) {
         ensure_role_allows(&doc, ServiceSide::Client)?;
@@ -1219,15 +1219,8 @@ fn run_add_batch(args: &AddArgs, path: &Path) -> Result<()> {
     // Ensure the sections exist.
     if pending.iter().any(|p| p.side == ServiceSide::Client) && doc.get("client").is_none() {
         let mut section = Table::new();
-        let remote = pending
-            .iter()
-            .find_map(|p| {
-                if p.side == ServiceSide::Client {
-                    p.entry.get("remote_addr").and_then(Item::as_str).map(str::to_string)
-                } else {
-                    None
-                }
-            })
+        let remote = batch_remote
+            .clone()
             .or(section_remote)
             .ok_or_else(|| {
                 anyhow!("Creating [client] requires a 'server:' key in a --client SPEC")
@@ -1299,14 +1292,26 @@ fn run_add_interactive(_args: &AddArgs, path: &Path) -> Result<()> {
         if name.is_empty() {
             break;
         }
-        let side_choice = prompt("Side: 1=client, 2=server", Some("1"))?;
-        let side = if side_choice.trim() == "2" {
-            ServiceSide::Server
-        } else {
-            ServiceSide::Client
+        let side = match prompt_select(
+            "Side",
+            &[
+                "client (forward a local port to the server)",
+                "server (publish a port for clients)",
+            ],
+        )? {
+            1 => ServiceSide::Server,
+            _ => ServiceSide::Client,
         };
         if service_exists(&doc, side, &name) {
             println!("A {} service named '{}' already exists. Skipping.", side.key(), name);
+            continue;
+        }
+        if pending.iter().any(|p| p.side == side && p.name == name) {
+            println!(
+                "A {} service named '{}' is already queued in this session. Skipping.",
+                side.key(),
+                name
+            );
             continue;
         }
         if let Err(e) = ensure_role_allows(&doc, side) {
@@ -1335,6 +1340,9 @@ fn run_add_interactive(_args: &AddArgs, path: &Path) -> Result<()> {
                 validate_host_port(&bind, "bind")?;
                 entry.insert("bind_addr", value(bind.as_str()));
             }
+        }
+        if prompt_select("Service type", &["tcp", "udp"])? == 1 {
+            entry.insert("type", value("udp"));
         }
         let token = generate_token();
         entry.insert("token", value(token.as_str()));
@@ -1379,27 +1387,34 @@ fn run_add_interactive(_args: &AddArgs, path: &Path) -> Result<()> {
 
     for p in pending {
         let r = insert_pending(&mut doc, p)?;
+        // Same masking policy as batch mode: never echo the token itself.
+        let token_note = if r["service"]["token"].is_string() {
+            " (token ••••)"
+        } else {
+            ""
+        };
         println!(
-            "Added {} service '{}' (token {})",
+            "Added {} service '{}'{}",
             r["side"].as_str().unwrap_or_default(),
             r["name"].as_str().unwrap_or_default(),
-            r["service"]["token"].as_str().unwrap_or_default()
+            token_note
         );
     }
 
     save_with_skeleton(path, &doc, created)?;
+    println!("Tokens were generated and written to the config file.");
     println!("Configuration saved to {}", path.display());
     Ok(())
 }
 
 /// Turn a parsed SPEC into a ready-to-insert service entry.
+///
+/// The spec's `server:` address is NOT written into the entry: it only
+/// feeds the [client] section's remote_addr (one config, one server).
 fn spec_to_pending(spec: ServiceSpec, side: ServiceSide) -> Result<PendingService> {
     let mut entry = Table::new();
     if spec.udp {
         entry.insert("type", value("udp"));
-    }
-    if let Some(r) = &spec.remote_addr {
-        entry.insert("remote_addr", value(r.as_str()));
     }
     if let Some(l) = &spec.local_addr {
         entry.insert("local_addr", value(l.as_str()));
@@ -1427,26 +1442,8 @@ fn insert_pending(doc: &mut DocumentMut, p: PendingService) -> Result<Value> {
     let side = p.side;
     let name = p.name;
 
-    // For client services with an explicit remote_addr equal to the section
-    // default, drop the redundant per-service override.
     let generated_token = p.generated_token.clone();
-    let mut entry = p.entry;
-    let section_remote = doc
-        .get(side.key())
-        .and_then(|s| s.get("remote_addr"))
-        .and_then(Item::as_str)
-        .map(str::to_string);
-    if let (Some(default), Some(override_val)) = (
-        section_remote,
-        entry
-            .get("remote_addr")
-            .and_then(Item::as_str)
-            .map(str::to_string),
-    ) {
-        if override_val == default {
-            entry.remove("remote_addr");
-        }
-    }
+    let entry = p.entry;
 
     let section = doc[side.key()]
         .as_table_like_mut()
@@ -1584,6 +1581,16 @@ fn prompt(message: &str, default: Option<&str>) -> Result<String> {
     Ok(input.interact_text()?)
 }
 
+/// Single-choice prompt backed by `dialoguer::Select`; returns the selected
+/// index (default: the first entry).
+fn prompt_select(message: &str, items: &[&str]) -> Result<usize> {
+    Ok(dialoguer::Select::new()
+        .with_prompt(message.to_string())
+        .items(items)
+        .default(0)
+        .interact()?)
+}
+
 fn generate_token() -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -1608,6 +1615,11 @@ fn service_exists(doc: &DocumentMut, side: ServiceSide, name: &str) -> bool {
         .and_then(Item::as_table_like)
         .map(|services| services.get(name).is_some())
         .unwrap_or(false)
+}
+
+/// Whether a config key holds a secret; masked in human `config list` output.
+fn is_sensitive_key(key: &str) -> bool {
+    key.contains("token") || key.contains("private_key") || key.contains("password")
 }
 
 fn load_document(path: &Path) -> Result<DocumentMut> {
@@ -1758,10 +1770,22 @@ mod tests {
     }
 
     #[test]
+    // Windows-oriented permission probe: set_readonly(false) is the point
+    // of the test; the Unix world-writable side effect is irrelevant here.
+    #[allow(clippy::permissions_set_readonly_false)]
     fn writability_probe_reflects_permissions() {
         let dir = std::env::temp_dir().join("rathole-x-writable-test");
         std::fs::create_dir_all(&dir).unwrap();
         let config = dir.join("config.toml");
+        // Clear a read-only leftover from a previous failed run
+        #[cfg(windows)]
+        {
+            if let Ok(md) = std::fs::metadata(&config) {
+                let mut perms = md.permissions();
+                perms.set_readonly(false);
+                let _ = std::fs::set_permissions(&config, perms);
+            }
+        }
         std::fs::write(&config, "[server]\nbind_addr = \"0.0.0.0:1\"\n[server.services]\n").unwrap();
 
         // Existing writable file: probe succeeds
@@ -1775,6 +1799,11 @@ mod tests {
             perms.set_readonly(true);
             std::fs::set_permissions(&config, perms).unwrap();
             assert!(!writable_by_current_user(&config), "read-only file not writable");
+            // Restore writability so the cleanup below (and the next test
+            // run) can delete the file
+            let mut perms = std::fs::metadata(&config).unwrap().permissions();
+            perms.set_readonly(false);
+            std::fs::set_permissions(&config, perms).unwrap();
         }
 
         // Missing file: directory probe
@@ -1843,7 +1872,9 @@ mod tests {
     }
 
     #[test]
-    fn per_service_remote_addr_parses() {
+    fn per_service_remote_addr_is_rejected() {
+        // Upstream alignment: one client config connects to one server, so
+        // a per-service remote_addr is an unknown field, not an override
         let toml = r#"
 [client]
 remote_addr = "srv-a.com:2333"
@@ -1855,19 +1886,127 @@ local_addr = "127.0.0.1:22"
 remote_addr = "srv-b.com:2333"
 token = "t"
 "#;
-        let config: crate::config::Config = toml::from_str(toml).unwrap();
-        let svc = config.client.unwrap().services.get("multi").cloned().unwrap();
-        assert_eq!(svc.remote_addr.as_deref(), Some("srv-b.com:2333"));
+        assert!(toml::from_str::<crate::config::Config>(toml).is_err());
     }
 
     #[test]
-    fn parse_remote_spec_validates() {
-        let (name, server) = parse_remote_spec("name:default;server:srv.com:2333").unwrap();
-        assert_eq!(name, "default");
-        assert_eq!(server, "srv.com:2333");
-        assert!(parse_remote_spec("server:srv.com:2333").is_err()); // no name
-        assert!(parse_remote_spec("name:x").is_err()); // no server
-        assert!(parse_remote_spec("name:x;server:bad").is_err()); // bad addr
-        assert!(parse_remote_spec("name:x;nope:y;server:srv.com:1").is_err()); // unknown key
+    fn add_single_rejects_mismatched_remote() {
+        let dir = std::env::temp_dir().join("rathole-x-add-remote-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[client]\nremote_addr = \"srv-a.com:2333\"\n\
+             [client.services.foo]\nlocal_addr = \"127.0.0.1:22\"\ntoken = \"t\"\n",
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let args = AddArgs {
+            entry: Some("bar".to_string()),
+            remote_addr: Some("srv-b.com:2333".to_string()),
+            local_addr: Some("127.0.0.1:80".to_string()),
+            yes: true,
+            ..Default::default()
+        };
+        assert!(
+            run_add_single(&args, &path).is_err(),
+            "a different server must be rejected"
+        );
+        assert_eq!(
+            before,
+            std::fs::read_to_string(&path).unwrap(),
+            "a rejected add must leave the file untouched"
+        );
+
+        // Same server as the section default stays a no-op flag
+        let args = AddArgs {
+            remote_addr: Some("srv-a.com:2333".to_string()),
+            ..args
+        };
+        assert!(run_add_single(&args, &path).is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn add_batch_rejects_conflicting_servers() {
+        let dir = std::env::temp_dir().join("rathole-x-batch-remote-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        let args = AddArgs {
+            client_specs: vec![
+                "name:a;server:srv-a.com:2333;local:127.0.0.1:22".to_string(),
+                "name:b;server:srv-b.com:2333;local:127.0.0.1:80".to_string(),
+            ],
+            yes: true,
+            ..Default::default()
+        };
+        assert!(
+            run_add_batch(&args, &path).is_err(),
+            "conflicting servers in one batch must fail"
+        );
+        assert!(!path.exists(), "a failed batch must not create the file");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn add_single_duplicate_is_side_effect_free() {
+        let dir = std::env::temp_dir().join("rathole-x-add-dup-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[server]\nbind_addr = \"0.0.0.0:2333\"\n\
+             [server.transport]\ntype = \"noise\"\n\
+             [server.transport.noise]\nlocal_private_key = \"ORIGINAL\"\n\
+             [server.services.mysvc]\nbind_addr = \"0.0.0.0:8080\"\ntoken = \"t\"\n",
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // Re-adding the same service with --noise would rotate the private
+        // key if the duplicate check ran after the write
+        let args = AddArgs {
+            entry: Some("mysvc".to_string()),
+            bind_addr: Some("0.0.0.0:9090".to_string()),
+            noise: true,
+            yes: true,
+            ..Default::default()
+        };
+        assert!(
+            run_add_single(&args, &path).is_err(),
+            "duplicate name must fail"
+        );
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(before, after, "a failed add must leave the file untouched");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn add_batch_rejects_internal_duplicates() {
+        let dir = std::env::temp_dir().join("rathole-x-batch-dup-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let _ = std::fs::remove_file(&path);
+
+        let args = AddArgs {
+            client_specs: vec![
+                "name:dup;server:srv.com:2333;local:127.0.0.1:8001".to_string(),
+                "name:dup;server:srv.com:2333;local:127.0.0.1:8002".to_string(),
+            ],
+            yes: true,
+            ..Default::default()
+        };
+        assert!(
+            run_add_batch(&args, &path).is_err(),
+            "duplicate names in one batch must fail"
+        );
+        assert!(!path.exists(), "a failed batch must not create the file");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

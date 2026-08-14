@@ -250,11 +250,16 @@ fn query_named_service(role: &str, name: &str) -> Option<(String, Option<u32>)> 
 }
 
 /// Render the full status for one service config.
+///
+/// `state_known` is false when the SCM state cannot be inferred (a `-c`
+/// config outside the service directory): the human output then says
+/// "unknown" instead of "not installed" (JSON keeps `state: null`).
 fn render_one(
     args: &StatusArgs,
     name: &str,
     config_path: &std::path::Path,
     service: &Option<(String, Option<u32>)>,
+    state_known: bool,
 ) -> Result<()> {
     let content = std::fs::read_to_string(config_path).ok();
     let parsed: Option<Config> = content
@@ -319,6 +324,11 @@ fn render_one(
                 None => println!("Service: {} — {}", name, colored),
             }
         }
+        None if !state_known => println!(
+            "Service: {} — {}",
+            name,
+            colorize("unknown (config outside the service directory)", YELLOW)
+        ),
         None => println!(
             "Service: {} — {}",
             name,
@@ -359,13 +369,13 @@ fn render_one(
     Ok(())
 }
 
-pub fn run_status(args: &StatusArgs) -> Result<()> {
-    if let Some(name) = &args.name {
-        crate::config_edit::validate_service_name(name)?;
-        let config_path = crate::config_edit::config_dir().join(format!("{}.toml", name));
-
-        #[cfg(windows)]
-        let role = std::fs::read_to_string(&config_path)
+/// SCM state of the named service, inferred from the role found in its
+/// config file. `None` when the config is unreadable or the service is not
+/// installed.
+fn service_state_for(name: &str, config_path: &Path) -> Option<(String, Option<u32>)> {
+    #[cfg(windows)]
+    {
+        let role = std::fs::read_to_string(config_path)
             .ok()
             .and_then(|c| toml::from_str::<Config>(&c).ok())
             .map(|c| {
@@ -374,16 +384,45 @@ pub fn run_status(args: &StatusArgs) -> Result<()> {
                 } else {
                     crate::config_edit::ServiceRole::Server
                 }
-            });
+            })?;
+        query_named_service(role.key(), name)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (name, config_path);
+        None
+    }
+}
 
-        #[cfg(windows)]
-        let service = role
-            .as_ref()
-            .and_then(|r| query_named_service(r.key(), name));
-        #[cfg(not(windows))]
-        let service: Option<(String, Option<u32>)> = None;
+pub fn run_status(args: &StatusArgs) -> Result<()> {
+    if let Some(name) = &args.name {
+        crate::config_edit::validate_service_name(name)?;
+        // An explicit `-c` overrides the default service config location.
+        let config_path = match &args.config {
+            Some(p) => p.clone(),
+            None => crate::config_edit::config_dir().join(format!("{}.toml", name)),
+        };
+        let service = service_state_for(name, &config_path);
+        return render_one(args, name, &config_path, &service, true);
+    }
 
-        return render_one(args, name, &config_path, &service);
+    // `-c` without --name: render that file's config tree directly. The SCM
+    // state is only inferred when the file lives in the service config
+    // directory; otherwise it is reported as unknown.
+    if let Some(config_path) = &args.config {
+        let name = config_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("config")
+            .to_owned();
+        let state_known =
+            config_path.parent() == Some(crate::config_edit::config_dir().as_path());
+        let service = if state_known {
+            service_state_for(&name, config_path)
+        } else {
+            None
+        };
+        return render_one(args, &name, config_path, &service, state_known);
     }
 
     // List mode: every installed service.
@@ -442,5 +481,52 @@ pub fn run_status(args: &StatusArgs) -> Result<()> {
     println!();
     println!("Run `rathole-x status --name <name>` for the full config tree.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CLIENT_TOML: &str = r#"
+[client]
+remote_addr = "127.0.0.1:2333"
+
+[client.services.svc]
+local_addr = "127.0.0.1:8080"
+token = "abc"
+"#;
+
+    /// `status -c <file>` renders the given file's config tree even when it
+    /// lives outside the service config directory (the SCM state is then
+    /// reported as unknown instead of "not installed").
+    #[test]
+    fn status_config_without_name_renders_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "rathole-x-status-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("demo.toml");
+        std::fs::write(&path, CLIENT_TOML).unwrap();
+
+        for json in [false, true] {
+            let args = StatusArgs {
+                config: Some(path.clone()),
+                name: None,
+                json,
+            };
+            run_status(&args).unwrap();
+        }
+
+        // `--name` combined with `-c` prefers the explicit file.
+        let args = StatusArgs {
+            config: Some(path.clone()),
+            name: Some("demo".to_owned()),
+            json: true,
+        };
+        run_status(&args).unwrap();
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 

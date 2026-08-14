@@ -165,26 +165,18 @@ impl RoleArg {
 pub struct AddArgs {
     /// Name of the service entry to add (optional: interactive or
     /// --client/--server spec mode adds one or more entries without it)
+    #[clap(conflicts_with_all = &["client-specs", "server-specs"])]
     pub entry: Option<String>,
-
-    /// Named server profiles, repeatable: "name:<id>;server:<host:port>".
-    ///
-    /// Referenced from --client specs via "remote:<id>" instead of an
-    /// inline "server:" address. Pure CLI sugar: resolved to concrete
-    /// addresses at write time, the config file stays upstream-compatible.
-    #[clap(long = "remote", value_name = "SPEC", multiple_occurrences(true))]
-    pub remote_specs: Vec<String>,
 
     /// Client service entries in compact form, repeatable.
     ///
     /// SPEC = "key:value;key:value;..." with keys:
-    ///   name (required), server (control channel host:port) or remote
-    ///   (named profile from --remote), local
+    ///   name (required), server (control channel host:port), local
     ///   (local forward target, required), token (auto-generated when
     ///   omitted), type (tcp|udp, default tcp).
-    /// The server key also acts as the [client] remote_addr default when the
-    /// section is created, and as a per-service override otherwise (a client
-    /// may connect to several servers).
+    /// The server key sets [client] remote_addr when the section is created;
+    /// when the section already exists it must match — one client config
+    /// connects to one server (use separate service instances for several).
     #[clap(long = "client", value_name = "SPEC", multiple_occurrences(true))]
     pub client_specs: Vec<String>,
 
@@ -202,7 +194,9 @@ pub struct AddArgs {
     pub remote_addr: Option<String>,
 
     /// Server-side service bind address (host:port)
-    #[clap(long)]
+    ///
+    /// Mutually exclusive with --local-addr: the two select opposite sides
+    #[clap(long, conflicts_with = "local-addr")]
     pub bind_addr: Option<String>,
 
     /// Client-side local forward target (host:port)
@@ -221,7 +215,9 @@ pub struct AddArgs {
     pub noise: bool,
 
     /// Server public key for the noise transport (client side only)
-    #[clap(long)]
+    ///
+    /// Requires --noise
+    #[clap(long, requires = "noise")]
     pub noise_key: Option<String>,
 
     /// The transport type of the service
@@ -292,9 +288,14 @@ pub struct InstallArgs {
     #[clap(long)]
     pub allow_user_config: bool,
 
-    /// Confirm and execute
+    /// Print the result as a single JSON object
+    #[clap(long)]
+    pub json: bool,
+
+    /// Skip the confirmation prompt
     ///
-    /// Without this flag only the usage of `install` is shown.
+    /// Without --yes an interactive terminal shows the install plan and asks
+    /// for confirmation; a non-interactive shell prints the usage and stops.
     #[clap(long)]
     pub yes: bool,
 }
@@ -344,9 +345,14 @@ pub struct UninstallArgs {
     #[clap(long)]
     pub all: bool,
 
-    /// Confirm and execute
+    /// Print the result as a single JSON object
+    #[clap(long)]
+    pub json: bool,
+
+    /// Skip the confirmation prompt
     ///
-    /// Without this flag only the usage of `uninstall` is shown.
+    /// Without --yes an interactive terminal shows the removal plan and asks
+    /// for confirmation; a non-interactive shell prints the usage and stops.
     #[clap(long)]
     pub yes: bool,
 }
@@ -393,7 +399,9 @@ pub struct SetArgs {
     pub default_token: Option<String>,
 
     /// [client] prefer IPv6 when resolving remote_addr
-    #[clap(long)]
+    ///
+    /// Accepts an optional value: `--prefer-ipv6` means `--prefer-ipv6 true`
+    #[clap(long, min_values(0), max_values(1), default_missing_value("true"))]
     pub prefer_ipv6: Option<bool>,
 
     /// [client] control channel heartbeat timeout in seconds
@@ -437,11 +445,15 @@ pub struct SetArgs {
     pub pkcs12_password: Option<String>,
 
     /// [transport.websocket] use TLS inside the websocket tunnel
-    #[clap(long)]
+    ///
+    /// Accepts an optional value: `--ws-tls` means `--ws-tls true`
+    #[clap(long, min_values(0), max_values(1), default_missing_value("true"))]
     pub ws_tls: Option<bool>,
 
     /// [transport.tcp] enable TCP_NODELAY
-    #[clap(long)]
+    ///
+    /// Accepts an optional value: `--nodelay` means `--nodelay true`
+    #[clap(long, min_values(0), max_values(1), default_missing_value("true"))]
     pub nodelay: Option<bool>,
 
     /// [transport.tcp] keepalive seconds
@@ -503,13 +515,129 @@ pub struct ServiceArgs {
     /// Apply to every installed service
     #[clap(long)]
     pub all: bool,
+
+    /// Print the result as a single JSON object
+    #[clap(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug, Clone, Default)]
 pub struct UpgradeArgs {
-    /// Confirm and execute
+    /// Print the result as a single JSON object
+    #[clap(long)]
+    pub json: bool,
+
+    /// Skip the confirmation prompt
     ///
-    /// Without this flag only the usage of `upgrade` is shown.
+    /// Without --yes an interactive terminal asks for confirmation;
+    /// a non-interactive shell prints the usage and stops.
     #[clap(long)]
     pub yes: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(argv: &[&str]) -> std::result::Result<Cli, clap::Error> {
+        Cli::try_parse_from(argv)
+    }
+
+    fn set_args(cli: Cli) -> SetArgs {
+        match cli.command {
+            Some(Commands::Config {
+                cmd: ConfigCmd::Set(s),
+            }) => *s,
+            other => panic!("expected `config set`, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn add_entry_conflicts_with_spec_flags() {
+        assert!(parse(&[
+            "rathole-x", "config", "add", "mysvc", "--client",
+            "name:a;server:127.0.0.1:2333;local:127.0.0.1:8080",
+        ])
+        .is_err());
+        assert!(parse(&[
+            "rathole-x", "config", "add", "mysvc", "--server", "name:a;bind:0.0.0.0:8080",
+        ])
+        .is_err());
+        // Each form alone still parses.
+        assert!(parse(&["rathole-x", "config", "add", "mysvc", "--yes"]).is_ok());
+        assert!(parse(&[
+            "rathole-x", "config", "add", "--client",
+            "name:a;server:127.0.0.1:2333;local:127.0.0.1:8080",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn add_bind_addr_conflicts_with_local_addr() {
+        assert!(parse(&[
+            "rathole-x", "config", "add", "mysvc", "--yes", "--bind-addr", "0.0.0.0:8080",
+            "--local-addr", "127.0.0.1:8080",
+        ])
+        .is_err());
+        assert!(parse(&[
+            "rathole-x", "config", "add", "mysvc", "--yes", "--bind-addr", "0.0.0.0:8080",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn add_noise_key_requires_noise() {
+        assert!(
+            parse(&["rathole-x", "config", "add", "mysvc", "--yes", "--noise-key", "abc"])
+                .is_err()
+        );
+        assert!(parse(&[
+            "rathole-x", "config", "add", "mysvc", "--yes", "--noise", "--noise-key", "abc",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn run_mode_flags_conflict() {
+        // The shared `group = "mode"` makes --client/--server mutually
+        // exclusive in clap 3.2 (ArgGroup defaults to multiple(false)).
+        assert!(parse(&["rathole-x", "run", "--client", "--server"]).is_err());
+        assert!(parse(&["rathole-x", "run", "--client"]).is_ok());
+    }
+
+    #[test]
+    fn set_bool_flags_accept_optional_value() {
+        // Bare flag: the missing value defaults to "true".
+        let s = set_args(parse(&["rathole-x", "config", "set", "--client", "--nodelay"]).unwrap());
+        assert_eq!(s.nodelay, Some(true));
+        let s =
+            set_args(parse(&["rathole-x", "config", "set", "--client", "--prefer-ipv6"]).unwrap());
+        assert_eq!(s.prefer_ipv6, Some(true));
+        let s = set_args(parse(&["rathole-x", "config", "set", "--client", "--ws-tls"]).unwrap());
+        assert_eq!(s.ws_tls, Some(true));
+
+        // Explicit values keep working in both spellings.
+        let s = set_args(
+            parse(&["rathole-x", "config", "set", "--client", "--nodelay", "false"]).unwrap(),
+        );
+        assert_eq!(s.nodelay, Some(false));
+        let s = set_args(
+            parse(&["rathole-x", "config", "set", "--client", "--ws-tls=false"]).unwrap(),
+        );
+        assert_eq!(s.ws_tls, Some(false));
+
+        // Unset stays None.
+        let s = set_args(parse(&["rathole-x", "config", "set", "--client"]).unwrap());
+        assert_eq!(s.nodelay, None);
+    }
+
+    #[test]
+    fn privileged_commands_accept_json_flag() {
+        assert!(parse(&["rathole-x", "service", "start", "--json"]).is_ok());
+        assert!(parse(&["rathole-x", "service", "stop", "--all", "--json"]).is_ok());
+        assert!(parse(&["rathole-x", "service", "restart", "--json"]).is_ok());
+        assert!(parse(&["rathole-x", "service", "install", "server", "--yes", "--json"]).is_ok());
+        assert!(parse(&["rathole-x", "service", "uninstall", "--yes", "--json"]).is_ok());
+        assert!(parse(&["rathole-x", "upgrade", "--yes", "--json"]).is_ok());
+    }
 }

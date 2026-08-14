@@ -9,9 +9,9 @@ RestartSec=5s
 LimitNOFILE=1048576
 
 # with root
-ExecStart=/usr/bin/rathole -s /etc/rathole/%i.toml
+ExecStart=/usr/bin/rathole-x run -c /etc/rathole/%i.toml
 # without root
-# ExecStart=%h/.local/bin/rathole -s %h/.local/etc/rathole/%i.toml
+# ExecStart=%h/.local/bin/rathole-x run -c %h/.local/etc/rathole/%i.toml
 
 [Install]
 WantedBy=multi-user.target

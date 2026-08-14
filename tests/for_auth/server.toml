@@ -1,0 +1,11 @@
+# Server side of tests/auth_test.rs. The client config deliberately uses a
+# different token, so every control channel handshake must be rejected.
+[server]
+bind_addr = "127.0.0.1:12333"
+default_token = "server_side_token_A"
+
+[server.transport]
+type = "tcp"
+
+[server.services.echo]
+bind_addr = "127.0.0.1:12080"

@@ -1,3 +1,7 @@
+# WARNING: test material only — do NOT use in production.
+# The private keys and the pkcs12 password in examples/tls/ are committed to
+# this repository and therefore public.
+
 [client]
 remote_addr = "127.0.0.1:2333"
 default_token = "123"

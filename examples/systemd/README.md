@@ -1,17 +1,17 @@
 ## Systemd Unit Examples
 
-The directory lists some systemd unit files for example, which can be used to run `rathole` as a service on Linux.
+The directory lists some systemd unit files for example, which can be used to run `rathole-x` as a service on Linux.
 
 [The `@` symbol in the name of unit files](https://superuser.com/questions/393423/the-symbol-and-systemctl-and-vsftpd) such as
-`rathole@.service` facilitates the management of multiple instances of `rathole`.
+`rathole@.service` facilitates the management of multiple instances of `rathole-x`.
 
-For the naming of the example, `ratholes` stands for `rathole --server`, and `ratholec` stands for `rathole --client`, `rathole` is just `rathole`.
+For the naming of the example, `ratholes` units run a server-role configuration and `ratholec` units run a client-role configuration; `rathole-x` itself determines the role from the configuration file passed to `rathole-x run -c`.
 
 For security, it is suggested to store configuration files with permission `600`, that is, only the owner can read the file, preventing arbitrary users on the system from accessing the secret tokens.
 
 ### With root privilege
 
-Assuming that `rathole` is installed in `/usr/bin/rathole`, and the configuration file is in `/etc/rathole/app1.toml`, the following steps show how to run an instance of `rathole --server` with root.
+Assuming that `rathole-x` is installed in `/usr/bin/rathole-x`, and the configuration file is in `/etc/rathole/app1.toml`, the following steps show how to run an instance of a server-role configuration with root.
 
 1. Create a service file.
 
@@ -35,15 +35,15 @@ sudo systemctl enable ratholes@app1 --now
 
 ### Without root privilege
 
-Assuming that `rathole` is installed in `~/.local/bin/rathole`, and the configuration file is in `~/.local/etc/rathole/app1.toml`, the following steps show how to run an instance of `rathole --server` without root.
+Assuming that `rathole-x` is installed in `~/.local/bin/rathole-x`, and the configuration file is in `~/.local/etc/rathole/app1.toml`, the following steps show how to run an instance of a server-role configuration without root.
 
 1. Edit the example service file as...
 
 ```txt
 # with root
-# ExecStart=/usr/bin/rathole -s /etc/rathole/%i.toml
+# ExecStart=/usr/bin/rathole-x run -c /etc/rathole/%i.toml
 # without root
-ExecStart=%h/.local/bin/rathole -s %h/.local/etc/rathole/%i.toml
+ExecStart=%h/.local/bin/rathole-x run -c %h/.local/etc/rathole/%i.toml
 ```
 
 2. Create a service file.
@@ -71,4 +71,4 @@ systemctl --user enable ratholes@app1 --now
 
 To run multiple services at once, simply add another configuration, say `app2.toml` under `/etc/rathole` (`~/.local/etc/rathole` for non-root), then run `sudo systemctl enable ratholes@app2 --now` (`systemctl --user enable ratholes@app2 --now` for non-root) to start an instance for that configuration.
 
-The same applies to `ratholec@.service` for `rathole --client` and `rathole@.service` for `rathole`.
+The same applies to `ratholec@.service` for a client-role configuration and `rathole@.service` for a configuration that may contain both roles.

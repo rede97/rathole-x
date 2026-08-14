@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use p12::PFX;
 use tokio_rustls::rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -34,15 +34,23 @@ impl Debug for TlsTransport {
 
 fn load_server_config(config: &TlsConfig) -> Result<Option<ServerConfig>> {
     if let Some(pkcs12_path) = config.pkcs12.as_ref() {
-        let buf = fs::read(pkcs12_path)?;
+        let buf = fs::read(pkcs12_path)
+            .with_context(|| format!("Failed to read `tls.pkcs12` {}", pkcs12_path))?;
         let pfx = PFX::parse(buf.as_slice())?;
-        let pass = config.pkcs12_password.as_ref().unwrap();
+        let pass = config
+            .pkcs12_password
+            .as_ref()
+            .ok_or_else(|| anyhow!("Missing `tls.pkcs12_password`"))?;
 
         let certs = pfx.cert_bags(pass)?;
         let keys = pfx.key_bags(pass)?;
 
         let chain: Vec<CertificateDer> = certs.into_iter().map(CertificateDer::from).collect();
-        let key = PrivatePkcs8KeyDer::from(keys.into_iter().next().unwrap());
+        let key = PrivatePkcs8KeyDer::from(
+            keys.into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("No private key found in `tls.pkcs12` {}", pkcs12_path))?,
+        );
 
         Ok(Some(
             ServerConfig::builder()
@@ -55,24 +63,35 @@ fn load_server_config(config: &TlsConfig) -> Result<Option<ServerConfig>> {
 }
 
 fn load_client_config(config: &TlsConfig) -> Result<Option<ClientConfig>> {
-    let cert = if let Some(path) = config.trusted_root.as_ref() {
-        rustls_pemfile::certs(&mut std::io::BufReader::new(fs::File::open(path).unwrap()))
-            .map(|cert| cert.unwrap())
-            .next()
-            .with_context(|| "Failed to read certificate")?
-    } else {
-        // read from native
-        match rustls_native_certs::load_native_certs() {
-            Ok(certs) => certs.into_iter().next().unwrap(),
-            Err(e) => {
-                eprintln!("Failed to load native certs: {}", e);
-                return Ok(None);
-            }
-        }
-    };
-
     let mut root_certs = RootCertStore::empty();
-    root_certs.add(cert).unwrap();
+
+    if let Some(path) = config.trusted_root.as_ref() {
+        let file = fs::File::open(path)
+            .with_context(|| format!("Failed to open `tls.trusted_root` {}", path))?;
+        // Trust every certificate in the PEM bundle, not just the first one
+        for cert in rustls_pemfile::certs(&mut std::io::BufReader::new(file)) {
+            let cert = cert
+                .with_context(|| format!("Failed to parse a certificate in {}", path))?;
+            root_certs
+                .add(cert)
+                .with_context(|| format!("Failed to trust a certificate in {}", path))?;
+        }
+    } else {
+        // Read from the native root store; trust all of it, not just the
+        // first certificate. An empty or unreadable store is a hard error
+        // instead of a panic or a silently useless connector.
+        let certs = rustls_native_certs::load_native_certs()
+            .map_err(|e| anyhow!("Failed to load native certs: {}", e))?;
+        for cert in certs {
+            root_certs
+                .add(cert)
+                .with_context(|| "Failed to trust a native root certificate")?;
+        }
+    }
+
+    if root_certs.is_empty() {
+        bail!("No root certificate available to verify the server");
+    }
 
     Ok(Some(
         ClientConfig::builder()
@@ -94,12 +113,8 @@ impl Transport for TlsTransport {
             .as_ref()
             .ok_or_else(|| anyhow!("Missing tls config"))?;
 
-        let connector = load_client_config(config)
-            .unwrap()
-            .map(|c| Arc::new(c).into());
-        let tls_acceptor = load_server_config(config)
-            .unwrap()
-            .map(|c| Arc::new(c).into());
+        let connector = load_client_config(config)?.map(|c| Arc::new(c).into());
+        let tls_acceptor = load_server_config(config)?.map(|c| Arc::new(c).into());
 
         Ok(TlsTransport {
             tcp,
@@ -128,14 +143,22 @@ impl Transport for TlsTransport {
     }
 
     async fn handshake(&self, conn: Self::RawStream) -> Result<Self::Stream> {
-        let conn = self.tls_acceptor.as_ref().unwrap().accept(conn).await?;
+        let conn = self
+            .tls_acceptor
+            .as_ref()
+            .ok_or_else(|| anyhow!("Missing `tls.pkcs12` for running as a server"))?
+            .accept(conn)
+            .await?;
         Ok(tokio_rustls::TlsStream::Server(conn))
     }
 
     async fn connect(&self, addr: &AddrMaybeCached) -> Result<Self::Stream> {
         let conn = self.tcp.connect(addr).await?;
 
-        let connector = self.connector.as_ref().unwrap();
+        let connector = self
+            .connector
+            .as_ref()
+            .ok_or_else(|| anyhow!("No tls client config available for running as a client"))?;
 
         let host_name = self
             .config
@@ -152,5 +175,5 @@ impl Transport for TlsTransport {
 }
 
 pub(crate) fn get_tcpstream(s: &TlsStream<TcpStream>) -> &TcpStream {
-    &s.get_ref().0
+    s.get_ref().0
 }

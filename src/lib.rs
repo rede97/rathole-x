@@ -16,10 +16,10 @@ pub use config::Config;
 pub use constants::UDP_BUFFER_SIZE;
 
 use cli::KeypairType;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use tokio::sync::{broadcast, mpsc};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "client")]
 mod client;
@@ -115,11 +115,17 @@ async fn dispatch_command(cmd: Commands, shutdown_rx: broadcast::Receiver<bool>)
 
         Service { cmd } => Ok(dispatch_service_command(cmd)?),
         Upgrade(u) => {
-            if !u.yes {
-                return print_subcommand_usage::<cli::UpgradeArgs>("upgrade");
+            if !confirm_action::<cli::UpgradeArgs>(
+                u.yes,
+                "upgrade",
+                "Replace the installed rathole-x binary in place and restart every \
+                 installed service. Proceed?",
+            )? {
+                return Ok(());
             }
-            platform::upgrade_binary()?;
-            Ok(())
+            run_action_json(u.json, "upgrade", &[], "binary upgraded", || {
+                platform::upgrade_binary()
+            })
         }
     }
 }
@@ -167,14 +173,48 @@ fn dispatch_service_command(cmd: cli::ServiceCmd) -> Result<()> {
     use cli::ServiceCmd::*;
     match cmd {
         Install(i) => {
-            if !i.yes {
-                return print_subcommand_usage::<cli::InstallArgs>("install");
-            }
             let role = match i.role {
                 Some(r) => config_edit::ServiceRole::from_cli(r),
                 None => bail!("A role is required: `service install server` or `service install client`"),
             };
-            let (name, config_path) = config_edit::service_config_path(i.name.as_deref())?;
+            // `-c` pins the service to an explicit config file; without it
+            // the config lives in the OS default directory.
+            let (name, config_path) = match &i.config {
+                Some(p) => {
+                    let path = std::env::current_dir()
+                        .context("failed to resolve the current directory for `--config`")?
+                        .join(p);
+                    let name = match &i.name {
+                        Some(n) => n.clone(),
+                        None => match path.file_stem().and_then(|s| s.to_str()) {
+                            Some(stem) => stem.to_owned(),
+                            None => bail!(
+                                "cannot derive a service name from `{}`; pass `--name`",
+                                path.display()
+                            ),
+                        },
+                    };
+                    config_edit::validate_service_name(&name)?;
+                    (name, path)
+                }
+                None => config_edit::service_config_path(i.name.as_deref())?,
+            };
+            if !confirm_action::<cli::InstallArgs>(
+                i.yes,
+                "install",
+                &format!(
+                    "Install a {} service '{}' (SCM name rathole-x-{}-{}) with config {}. Proceed?",
+                    role.key(),
+                    name,
+                    role.key(),
+                    name,
+                    config_path.display()
+                ),
+            )? {
+                return Ok(());
+            }
+            // The role check runs before any elevation: a config created for
+            // the wrong role is rejected in the caller's unprivileged context.
             let created = config_edit::ensure_role_config(&config_path, role)?;
             if created {
                 println!(
@@ -183,24 +223,80 @@ fn dispatch_service_command(cmd: cli::ServiceCmd) -> Result<()> {
                     config_path.display()
                 );
             }
-            platform::install_service(&i, role, &name, &config_path)?;
-            Ok(())
+            let names = [name.clone()];
+            run_action_json(i.json, "install", &names, "service installed", || {
+                platform::install_service(&i, role, &name, &config_path)
+            })
         }
         Uninstall(u) => {
-            if !u.yes {
-                return print_subcommand_usage::<cli::UninstallArgs>("uninstall");
-            }
             if u.all {
-                platform::uninstall_all(&u)?;
-                return Ok(());
+                let names: Vec<String> = config_edit::list_installed_services()?
+                    .into_iter()
+                    .map(|(n, _)| n)
+                    .collect();
+                if !confirm_action::<cli::UninstallArgs>(
+                    u.yes,
+                    "uninstall",
+                    &format!(
+                        "Remove EVERY installed rathole-x service ({}), their configs and \
+                         the shared binary. Proceed?",
+                        if names.is_empty() {
+                            "none".to_owned()
+                        } else {
+                            names.join(", ")
+                        }
+                    ),
+                )? {
+                    return Ok(());
+                }
+                return run_action_json(
+                    u.json,
+                    "uninstall",
+                    &names,
+                    "all services uninstalled",
+                    || platform::uninstall_all(&u),
+                );
             }
             let config_path =
                 config_edit::resolve_service_config(u.config.as_ref(), u.name.as_deref())?;
-            platform::uninstall_service(&u, &config_path)?;
-            Ok(())
+            let name = config_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_owned();
+            if !confirm_action::<cli::UninstallArgs>(
+                u.yes,
+                "uninstall",
+                &format!(
+                    "Uninstall service '{}' (config {}){}. Proceed?",
+                    name,
+                    config_path.display(),
+                    if u.purge {
+                        " and delete its config file"
+                    } else {
+                        ""
+                    }
+                ),
+            )? {
+                return Ok(());
+            }
+            let names = [name];
+            run_action_json(u.json, "uninstall", &names, "service uninstalled", || {
+                platform::uninstall_service(&u, &config_path)
+            })
         }
         Run { config } => platform::run_service(config),
-        other => Ok(platform::control_service(other)?),
+        other => {
+            let (action, json, names) = match &other {
+                Start(a) => ("start", a.json, control_target_names(a.name.as_deref())),
+                Stop(a) => ("stop", a.json, control_target_names(a.name.as_deref())),
+                Restart(a) => ("restart", a.json, control_target_names(a.name.as_deref())),
+                _ => unreachable!("install/uninstall/run are handled above"),
+            };
+            run_action_json(json, action, &names, "ok", || {
+                platform::control_service(other)
+            })
+        }
     }
 }
 
@@ -211,6 +307,94 @@ fn print_subcommand_usage<T: clap::Args>(name: &str) -> Result<()> {
     cmd.print_help()?;
     println!();
     Ok(())
+}
+
+/// Environment variable set after a successful interactive confirmation.
+/// The UAC elevation relay re-runs the same command line in a child process
+/// that has no TTY; the inherited variable marks that child as confirmed so
+/// it does not fall back to printing usage.
+const CONFIRMED_ENV: &str = "RATHOLE_X_CONFIRMED";
+
+/// Gate a privileged subcommand behind user confirmation.
+///
+/// `--yes` (or an already-confirmed parent process, see `CONFIRMED_ENV`)
+/// proceeds directly. On an interactive terminal (both stdin and stdout are
+/// TTYs) the user is shown an action summary and asked to confirm. On a
+/// non-interactive shell the subcommand usage is printed and nothing is
+/// executed (legacy behavior for scripts).
+///
+/// Returns `Ok(true)` when the operation may proceed.
+fn confirm_action<T: clap::Args>(yes: bool, subcommand: &str, summary: &str) -> Result<bool> {
+    if yes || std::env::var_os(CONFIRMED_ENV).is_some() {
+        return Ok(true);
+    }
+    if !(atty::is(atty::Stream::Stdin) && atty::is(atty::Stream::Stdout)) {
+        print_subcommand_usage::<T>(subcommand)?;
+        return Ok(false);
+    }
+    let confirmed = dialoguer::Confirm::new()
+        .with_prompt(summary.to_string())
+        .default(false)
+        .interact()
+        .context("failed to read the confirmation prompt")?;
+    if !confirmed {
+        println!("Aborted.");
+        return Ok(false);
+    }
+    std::env::set_var(CONFIRMED_ENV, "1");
+    Ok(true)
+}
+
+/// Print the machine-readable (`--json`) result line of a service action.
+fn emit_action_json(action: &str, names: &[String], success: bool, message: &str) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "action": action,
+            "names": names,
+            "success": success,
+            "message": message,
+        })
+    );
+}
+
+/// Run a service action, emitting its `--json` result line when requested.
+/// The platform layer reports human-readable progress itself; this only adds
+/// the final machine-readable summary.
+fn run_action_json(
+    json: bool,
+    action: &str,
+    names: &[String],
+    ok_message: &str,
+    f: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    match f() {
+        Ok(()) => {
+            if json {
+                emit_action_json(action, names, true, ok_message);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if json {
+                emit_action_json(action, names, false, &format!("{:#}", e));
+            }
+            Err(e)
+        }
+    }
+}
+
+/// The services a control action (start/stop/restart) applies to: the
+/// explicit `--name`, or every installed service for `--all` and for the
+/// implicit single-service targeting (the platform layer errors out when the
+/// implicit target is ambiguous).
+fn control_target_names(name: Option<&str>) -> Vec<String> {
+    match name {
+        Some(n) => vec![n.to_owned()],
+        None => config_edit::list_installed_services()
+            .map(|v| v.into_iter().map(|(n, _)| n).collect())
+            .unwrap_or_default(),
+    }
 }
 
 async fn run_with_config(
@@ -264,13 +448,34 @@ async fn run_with_config(
     );
     let mut last_instance: Option<Instance> = None;
 
-    while let Some(e) = cfg_watcher.event_rx.recv().await {
+    // Each instance generation gets its own shutdown channel. A General
+    // restart signals only the old generation; the process-level
+    // `shutdown_tx` stays reserved for the watcher, the retry loop and the
+    // external signal, so a hot reload can never stop the whole process.
+    let mut instance_shutdown_tx: Option<broadcast::Sender<bool>> = None;
+    let mut process_shutdown_rx = shutdown_tx.subscribe();
+
+    loop {
+        let e = tokio::select! {
+            e = cfg_watcher.event_rx.recv() => match e {
+                Some(e) => e,
+                None => break,
+            },
+            _ = process_shutdown_rx.recv() => break,
+        };
         match e {
             ConfigChange::General(config) => {
                 if let Some((i, _)) = last_instance.take() {
                     info!("General configuration change detected. Restarting...");
-                    let _ = shutdown_tx.send(true);
-                    i.await??;
+                    if let Some(tx) = instance_shutdown_tx.take() {
+                        let _ = tx.send(true);
+                    }
+                    // The instance already logged its own error; only a
+                    // join failure (panic) is worth reporting here. Never
+                    // propagate: a dead instance must not kill the process.
+                    if let Err(e) = i.await {
+                        error!("The last instance task failed to join: {}", e);
+                    }
                 }
 
                 debug!("{:?}", config);
@@ -283,6 +488,7 @@ async fn run_with_config(
                     1
                 };
 
+                let (itx, _) = broadcast::channel(1);
                 let mut service_update_txs = Vec::with_capacity(halves);
                 let mut service_update_rxs = Vec::with_capacity(halves);
                 let mut shutdown_rxs = Vec::with_capacity(halves);
@@ -290,17 +496,27 @@ async fn run_with_config(
                     let (service_update_tx, service_update_rx) = mpsc::channel(1024);
                     service_update_txs.push(service_update_tx);
                     service_update_rxs.push(service_update_rx);
-                    shutdown_rxs.push(shutdown_tx.subscribe());
+                    shutdown_rxs.push(itx.subscribe());
                 }
+                instance_shutdown_tx = Some(itx);
 
+                let client = run_args.client;
+                let server = run_args.server;
                 last_instance = Some((
-                    tokio::spawn(run_instance(
-                        *config,
-                        run_args.client,
-                        run_args.server,
-                        shutdown_rxs,
-                        service_update_rxs,
-                    )),
+                    tokio::spawn(async move {
+                        let r = run_instance(
+                            *config,
+                            client,
+                            server,
+                            shutdown_rxs,
+                            service_update_rxs,
+                        )
+                        .await;
+                        if let Err(e) = &r {
+                            error!("The instance exited with an error: {:#}", e);
+                        }
+                        r
+                    }),
                     service_update_txs,
                 ));
             }
@@ -315,7 +531,16 @@ async fn run_with_config(
         }
     }
 
-    let _ = shutdown_tx.send(true);
+    // Final teardown: stop the current generation and actually wait for it,
+    // so control channels and connection pools shut down cleanly.
+    if let Some(tx) = instance_shutdown_tx.take() {
+        let _ = tx.send(true);
+    }
+    if let Some((i, _)) = last_instance.take() {
+        if let Err(e) = i.await {
+            error!("The last instance task failed to join: {}", e);
+        }
+    }
 
     Ok(())
 }
@@ -328,7 +553,9 @@ async fn run_instance(
     mut service_updates: Vec<mpsc::Receiver<ConfigChange>>,
 ) -> Result<()> {
     match determine_run_mode(&config, client, server) {
-        RunMode::Undetermine => panic!("Cannot determine running as a server or a client"),
+        RunMode::Undetermine => bail!(
+            "cannot determine the running mode: pass `--server` or `--client`, or add a [server]/[client] section to the config"
+        ),
         RunMode::Client => {
             #[cfg(not(feature = "client"))]
             crate::helper::feature_not_compile("client");
@@ -489,5 +716,27 @@ mod tests {
                 t.run_mode
             );
         }
+    }
+
+    #[test]
+    fn confirm_action_yes_short_circuits_without_tty() {
+        // `--yes` proceeds without touching the terminal, so this is safe to
+        // run in a non-interactive test harness.
+        assert!(confirm_action::<cli::UpgradeArgs>(true, "upgrade", "summary").unwrap());
+    }
+
+    #[test]
+    fn confirm_action_honors_confirmed_env() {
+        std::env::set_var(CONFIRMED_ENV, "1");
+        assert!(confirm_action::<cli::InstallArgs>(false, "install", "summary").unwrap());
+        std::env::remove_var(CONFIRMED_ENV);
+    }
+
+    #[test]
+    fn control_target_names_prefers_explicit_name() {
+        assert_eq!(
+            control_target_names(Some("svc")),
+            vec!["svc".to_string()]
+        );
     }
 }

@@ -47,6 +47,28 @@ In short, the command used with openssl 3 to create the PKCS#12 archive with `ru
 openssl pkcs12 -export -out identity.pfx -inkey server.key -in server.crt -certfile ca_chain_certs.crt -legacy
 ```
 
+## WebSocket
+
+The `websocket` transport tunnels the rathole protocol over WebSocket, which is useful when the network only allows HTTP(S)-ish traffic.
+
+It has a single option, `tls`, under `transport.websocket`: `true` uses a secure `wss://` connection, `false` uses plain `ws://`. TLS termination/certificates are expected to be handled by the WebSocket layer's underlying TLS support.
+
+```toml
+# Server Side Configuration
+[server.transport]
+type = "websocket"
+[server.transport.websocket]
+tls = true
+
+# Client Side Configuration
+[client.transport]
+type = "websocket"
+[client.transport.websocket]
+tls = true
+```
+
+Both sides must agree on the `tls` value.
+
 ## Noise Protocol
 
 ### Quickstart for the Noise Protocl
@@ -61,12 +83,12 @@ To use it, a X25519 keypair is needed.
 
 #### Generate a Keypair
 
-1. Run `rathole --genkey`, which will generate a keypair using the default X25519 algorithm.
+1. Run `rathole-x genkey`, which will generate a keypair using the default X25519 algorithm.
 
 It emits:
 
 ```sh
-$ rathole --genkey
+$ rathole-x genkey
 Private Key:
 cQ/vwIqNPJZmuM/OikglzBo/+jlYGrOt9i0k5h5vn1Q=
 

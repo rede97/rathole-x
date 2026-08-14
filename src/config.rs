@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
 use std::path::Path;
@@ -63,11 +63,6 @@ pub struct ClientServiceConfig {
     #[serde(skip)]
     pub name: String,
     pub local_addr: String,
-    /// Control channel address override: this service connects to a
-    /// different server than [client] remote_addr. None = use the global
-    /// remote_addr.
-    #[serde(default)]
-    pub remote_addr: Option<String>,
     #[serde(default)] // Default to false
     pub prefer_ipv6: bool,
     pub token: Option<MaskedString>,
@@ -84,7 +79,7 @@ impl ClientServiceConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ServiceType {
     #[serde(rename = "tcp")]
     #[default]
@@ -242,6 +237,13 @@ pub struct Config {
 }
 
 impl Config {
+    /// Parse and validate a configuration string with the same rules as the
+    /// runtime loader (`from_file`). Config-editing commands use this to
+    /// refuse writing a configuration the runtime would reject.
+    pub fn validate(s: &str) -> Result<()> {
+        Config::from_str(s).map(|_| ())
+    }
+
     fn from_str(s: &str) -> Result<Config> {
         let mut config: Config = toml::from_str(s).with_context(|| "Failed to parse the config")?;
 
@@ -261,7 +263,27 @@ impl Config {
     }
 
     fn validate_server_config(server: &mut ServerConfig) -> Result<()> {
+        // The control channel needs a fixed port; 0 would pick a random one
+        if server
+            .bind_addr
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            == Some(0)
+        {
+            bail!(
+                "`server.bind_addr` `{}` must not use port 0",
+                server.bind_addr
+            );
+        }
+
+        if let Some(token) = &server.default_token {
+            if token.is_empty() {
+                bail!("`server.default_token` must not be empty");
+            }
+        }
+
         // Validate services
+        let mut bind_addrs = HashSet::new();
         for (name, s) in &mut server.services {
             s.name = name.clone();
             if s.token.is_none() {
@@ -269,6 +291,18 @@ impl Config {
                 if s.token.is_none() {
                     bail!("The token of service {} is not set", name);
                 }
+            }
+            if s.token.as_ref().is_some_and(|t| t.is_empty()) {
+                bail!("the token of service `{}` is empty", name);
+            }
+            // TCP and UDP ports are separate namespaces; only an exact
+            // (address, type) repeat is a conflict
+            if !bind_addrs.insert((s.bind_addr.clone(), s.service_type)) {
+                bail!(
+                    "duplicate `bind_addr` `{}` in `[server.services]` (service `{}`)",
+                    s.bind_addr,
+                    name
+                );
             }
         }
 
@@ -278,6 +312,16 @@ impl Config {
     }
 
     fn validate_client_config(client: &mut ClientConfig) -> Result<()> {
+        // 0 would reconnect in a tight loop
+        if client.retry_interval == 0 {
+            bail!("`client.retry_interval` must be greater than 0");
+        }
+        if let Some(token) = &client.default_token {
+            if token.is_empty() {
+                bail!("`client.default_token` must not be empty");
+            }
+        }
+
         // Validate services
         for (name, s) in &mut client.services {
             s.name = name.clone();
@@ -286,6 +330,15 @@ impl Config {
                 if s.token.is_none() {
                     bail!("The token of service {} is not set", name);
                 }
+            }
+            if s.token.as_ref().is_some_and(|t| t.is_empty()) {
+                bail!("the token of service `{}` is empty", name);
+            }
+            if s.retry_interval == Some(0) {
+                bail!(
+                    "`retry_interval` of service `{}` must be greater than 0",
+                    name
+                );
             }
             if s.retry_interval.is_none() {
                 s.retry_interval = Some(client.retry_interval);
@@ -303,8 +356,13 @@ impl Config {
             .proxy
             .as_ref()
             .map_or(Ok(()), |u| match u.scheme() {
-                "socks5" => Ok(()),
-                "http" => Ok(()),
+                // helper.rs connects to (host, port) unconditionally; both
+                // must be present or the runtime would panic
+                "socks5" | "http" if u.host_str().is_some() && u.port().is_some() => Ok(()),
+                "socks5" | "http" => Err(anyhow!(format!(
+                    "proxy url `{}` must include a host and a port",
+                    u
+                ))),
                 _ => Err(anyhow!(format!("Unknown proxy scheme: {}", u.scheme()))),
             })?;
         match config.transport_type {
@@ -324,7 +382,11 @@ impl Config {
                 Ok(())
             }
             TransportType::Noise => {
-                // The check is done in transport
+                // The transport constructor fails with "Missing noise config"
+                // when the section is absent
+                if config.noise.is_none() {
+                    return Err(anyhow!("missing noise configuration for `noise` transport"));
+                }
                 Ok(())
             }
             TransportType::Websocket => Ok(()),
@@ -451,7 +513,12 @@ mod tests {
 
     #[test]
     fn test_validate_client_config() -> Result<()> {
-        let mut cfg = ClientConfig::default();
+        // Derive-Default leaves retry_interval at 0, which validation now
+        // rejects; deserialization would have applied the serde default
+        let mut cfg = ClientConfig {
+            retry_interval: default_client_retry_interval(),
+            ..Default::default()
+        };
 
         cfg.services.insert(
             "foo1".into(),
@@ -497,5 +564,150 @@ mod tests {
             "4"
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_reject_empty_token() {
+        // An empty service token: anyone can compute the session key
+        let s = r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+[server.services.foo]
+bind_addr = "0.0.0.0:8080"
+token = ""
+"#;
+        assert!(Config::from_str(s).is_err());
+
+        // An empty default_token is rejected even with empty services
+        let s = r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = ""
+[server.services]
+"#;
+        assert!(Config::from_str(s).is_err());
+
+        // Client side: empty default_token propagating to a service
+        let s = r#"
+[client]
+remote_addr = "example.com:2333"
+default_token = ""
+[client.services.foo]
+local_addr = "127.0.0.1:8080"
+"#;
+        assert!(Config::from_str(s).is_err());
+
+        // A non-empty token still passes
+        let s = r#"
+[client]
+remote_addr = "example.com:2333"
+[client.services.foo]
+local_addr = "127.0.0.1:8080"
+token = "t"
+"#;
+        assert!(Config::from_str(s).is_ok());
+    }
+
+    #[test]
+    fn test_reject_zero_retry_interval() {
+        // Section level
+        let s = r#"
+[client]
+remote_addr = "example.com:2333"
+retry_interval = 0
+default_token = "t"
+[client.services]
+"#;
+        assert!(Config::from_str(s).is_err());
+
+        // Service level
+        let s = r#"
+[client]
+remote_addr = "example.com:2333"
+default_token = "t"
+[client.services.foo]
+local_addr = "127.0.0.1:8080"
+retry_interval = 0
+"#;
+        assert!(Config::from_str(s).is_err());
+
+        // A positive interval still passes
+        let s = r#"
+[client]
+remote_addr = "example.com:2333"
+retry_interval = 5
+default_token = "t"
+[client.services.foo]
+local_addr = "127.0.0.1:8080"
+retry_interval = 2
+"#;
+        assert!(Config::from_str(s).is_ok());
+    }
+
+    #[test]
+    fn test_validate_server_bind_addr() {
+        // Control channel on port 0
+        let s = r#"
+[server]
+bind_addr = "0.0.0.0:0"
+[server.services]
+"#;
+        assert!(Config::from_str(s).is_err());
+
+        // Two services publishing the same address with the same type
+        let s = r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+[server.services.a]
+bind_addr = "0.0.0.0:8080"
+[server.services.b]
+bind_addr = "0.0.0.0:8080"
+"#;
+        assert!(Config::from_str(s).is_err());
+
+        // The same address shared by tcp and udp services is legal
+        // (separate port namespaces); distinct addresses pass too
+        let s = r#"
+[server]
+bind_addr = "0.0.0.0:2333"
+default_token = "t"
+[server.services.a]
+bind_addr = "0.0.0.0:5202"
+[server.services.b]
+type = "udp"
+bind_addr = "0.0.0.0:5202"
+[server.services.c]
+bind_addr = "0.0.0.0:8080"
+"#;
+        assert!(Config::from_str(s).is_ok());
+    }
+
+    #[test]
+    fn test_reject_proxy_without_host_or_port() {
+        // helper.rs would panic on a portless proxy url
+        let s = r#"
+[client]
+remote_addr = "example.com:2333"
+default_token = "t"
+[client.transport]
+type = "tcp"
+[client.transport.tcp]
+proxy = "socks5://127.0.0.1"
+[client.services]
+"#;
+        assert!(Config::from_str(s).is_err());
+
+        let s = r#"
+[client]
+remote_addr = "example.com:2333"
+default_token = "t"
+[client.transport]
+type = "tcp"
+[client.transport.tcp]
+proxy = "socks5://user:pass@127.0.0.1:1080"
+[client.services]
+"#;
+        Config::from_str(s).unwrap();
     }
 }

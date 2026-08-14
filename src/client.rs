@@ -244,7 +244,12 @@ async fn run_data_channel_for_tcp<T: Transport>(
     let mut local = TcpStream::connect(local_addr)
         .await
         .with_context(|| format!("Failed to connect to {}", local_addr))?;
-    let _ = copy_bidirectional(&mut conn, &mut local).await;
+    if let Err(e) = copy_bidirectional(&mut conn, &mut local).await {
+        debug!(
+            "Failed to forward TCP between the data channel and the local service: {:#}",
+            e
+        );
+    }
     Ok(())
 }
 
@@ -298,15 +303,17 @@ async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &st
             // Drop the reader lock
             drop(m);
 
-            // Grab the writer lock
-            // This is the only thread that will try to grab the writer lock
-            // So no need to worry about some other thread has already set up
-            // the mapping between the gap of dropping the reader lock and
-            // grabbing the writer lock
-            let mut m = port_map.write().await;
-
+            // Connect to the local service without holding any lock,
+            // so the forwarders' cleanup (which grabs the write lock)
+            // is never blocked behind this await
             match udp_connect(local_addr, prefer_ipv6).await {
                 Ok(s) => {
+                    // Grab the writer lock only for the insertion.
+                    // This loop is the only inserter, so no other thread
+                    // can have set up the mapping in the gap; forwarders
+                    // only take the write lock to remove expired entries
+                    let mut m = port_map.write().await;
+
                     let (inbound_tx, inbound_rx) = mpsc::channel(UDP_SENDQ_SIZE);
                     m.insert(packet.from, inbound_tx);
                     tokio::spawn(run_udp_forwarder(
@@ -323,9 +330,15 @@ async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &st
             }
         }
 
-        // Now there should be a udp forwarder that can receive the packet
-        let m = port_map.read().await;
-        if let Some(tx) = m.get(&packet.from) {
+        // Now there should be a udp forwarder that can receive the packet.
+        // Clone the sender and drop the read lock before awaiting the
+        // bounded channel, so a full channel can never deadlock against
+        // the forwarders' write-lock cleanup
+        let tx = {
+            let m = port_map.read().await;
+            m.get(&packet.from).cloned()
+        };
+        if let Some(tx) = tx {
             let _ = tx.send(packet.data).await;
         }
     }
@@ -348,10 +361,16 @@ async fn run_udp_forwarder(
         tokio::select! {
             // Receive from the server
             data = inbound_rx.recv() => {
-                if let Some(data) = data {
-                    s.send(&data).await?;
-                } else {
-                    break;
+                match data {
+                    Some(data) => {
+                        if let Err(e) = s.send(&data).await {
+                            // Break instead of returning early, so the
+                            // stale mapping is always removed below
+                            debug!("Failed to send to the local service: {:#}", e);
+                            break;
+                        }
+                    }
+                    None => break,
                 }
             },
 
@@ -359,7 +378,10 @@ async fn run_udp_forwarder(
             val = s.recv(&mut buf) => {
                 let len = match val {
                     Ok(v) => v,
-                    Err(_) => break
+                    Err(e) => {
+                        debug!("Failed to receive from the local service: {:#}", e);
+                        break;
+                    }
                 };
 
                 let t = UdpTraffic{
@@ -367,7 +389,12 @@ async fn run_udp_forwarder(
                     data: Bytes::copy_from_slice(&buf[..len])
                 };
 
-                outbount_tx.send(t).await?;
+                // A send error means the outbound side is gone; break and
+                // clean up instead of skipping the removal below
+                if let Err(e) = outbount_tx.send(t).await {
+                    debug!("Failed to forward UDP traffic to the server: {:#}", e);
+                    break;
+                }
             },
 
             // No traffic for the duration of UDP_TIMEOUT, clean up the state
@@ -540,8 +567,9 @@ impl ControlChannelHandle {
                         error!("{:#}. Retry in {:?}...", err, duration);
                         time::sleep(duration).await;
                     } else {
-                        // Should never reach
-                        panic!("{:#}. Break", err);
+                        // Should never be reached with the current backoff policy
+                        error!("{:#}. Backoff exhausted. Break", err);
+                        break;
                     }
 
                     start = Instant::now();

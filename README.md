@@ -100,7 +100,7 @@ Read-only commands (`status`, `list`, `run`) and `install`/`uninstall` are never
 `config add|remove|list|set` and `status` accept `--json` for machine-readable output; `service install`, `service uninstall` and `upgrade` require `--yes` to confirm. The upstream positional `./rathole config.toml` form is **not supported** in this fork — run the daemon with `run -c CONFIG` (with no `-c`, the OS default path is used: Windows `%ProgramData%\rathole-x\rathole-x.toml`, Linux `/etc/rathole-x.toml`). Commands with `--name` target the installed service of that name; when both `--name` and `-c` are omitted and exactly one service is installed, that one is used.
 
 - `run [-c CONFIG] [--server|--client]` — run the daemon; `--server`/`--client` force a mode. A dual-section config runs both halves in one process.
-- `config add [<NAME>] [--client SPEC]... [--server SPEC]... [--remote-addr A] [--bind-addr A] [--local-addr A] [--token T] [--noise] [--noise-key K] [--type tcp|udp] [-c] [--name N] [--json] [--yes]` — add services by name and flags, or in batches via repeatable `--client "server:...;name:...;local:...;token:...;type:..."` / `--server "name:...;bind:...;token:...;type:..."` specs (one write, one hot-reload). Without a name in a TTY it runs a multi-round interactive wizard (empty name finishes). Client specs accept a `server:` key: it sets the [client] default on a fresh section, or a per-service override otherwise (a client may connect to several servers).
+- `config add [<NAME>] [--client SPEC]... [--server SPEC]... [--remote-addr A] [--bind-addr A] [--local-addr A] [--token T] [--noise] [--noise-key K] [--type tcp|udp] [-c] [--name N] [--json] [--yes]` — add services by name and flags, or in batches via repeatable `--client "server:...;name:...;local:...;token:...;type:..."` / `--server "name:...;bind:...;token:...;type:..."` specs (one write, one hot-reload). Without a name in a TTY it runs a multi-round interactive wizard (empty name finishes). One client config connects to exactly one server (upstream model): the spec's `server:` key sets the `[client] remote_addr` default on a fresh section, and must match it when the section already exists — to use another server, install a separate service instance (`service install client --name <N>`).
 - `config remove <NAME> [-c] [--name N] [--json]` — remove a service.
 - `config list [-c] [--name N] [--json]` — list services.
 - `config set <--client|--server> [global fields] [-c] [--name N] [--json]` — set global fields: `--remote-addr`, `--bind-addr`, `--default-token`, `--prefer-ipv6`, `--heartbeat-timeout`, `--retry-interval`, `--heartbeat-interval`, `--transport tcp|tls|noise|websocket`, `--noise`, `--noise-key`, `--trusted-root`, `--hostname`, `--pkcs12`, `--pkcs12-password`, `--ws-tls`, `--nodelay`, `--keepalive-secs`, `--keepalive-interval`, `--proxy`.
@@ -113,7 +113,7 @@ Read-only commands (`status`, `list`, `run`) and `install`/`uninstall` are never
 
 ---
 
-> 以下是以前的 README(原版 rathole 文档)
+> The following is the original README (upstream rathole documentation)
 
 ---
 
@@ -165,11 +165,9 @@ The `rathole-x` binary is fully subcommand-based; running it bare prints the hel
 # scripts can pass every flag and read machine-readable output with --json.
 ./rathole-x config add --client "server:myserver.com:2333;name:my_nas_ssh;local:127.0.0.1:22" --json
 
-# Named server profiles (CLI sugar; resolved to concrete addresses at write
-# time so the config file stays upstream-compatible):
-./rathole-x config add --remote "name:default;server:srv-a.com:2333" --remote "name:backup;server:srv-b.com:2333" \
-  --client "remote:default;name:nas;local:127.0.0.1:22" \
-  --client "remote:backup;name:db;local:127.0.0.1:5432"
+# Batch-add several services for the same server in one write
+./rathole-x config add --client "server:srv-a.com:2333;name:nas;local:127.0.0.1:22" \
+  --client "server:srv-a.com:2333;name:db;local:127.0.0.1:5432"
 
 # Generate a noise keypair (replaces the removed --genkey flag)
 ./rathole-x genkey

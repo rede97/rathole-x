@@ -69,8 +69,12 @@ embedded = ["server", "client", "hot-reload", "noise"]
 console = ["console-subscriber", "tokio/tracing"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+# Note: no `panic = "abort"` for dev on purpose. profile.test inherits
+# profile.dev and Cargo ignores `panic` on profile.test itself, so an abort
+# dev profile would make the first failing assertion kill the whole test
+# harness process and lose cargo's per-test report. Unwind keeps failures
+# isolated per test. Release/bench below still abort.
 [profile.dev]
-panic = "abort"
 
 [profile.release]
 panic = "abort"
