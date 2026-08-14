@@ -1,5 +1,9 @@
 name: Release
 
+# Windows-only for now. The full cross-platform matrix was deliberately
+# reduced: Linux/macOS/ARM targets can be restored once systemd support
+# lands (see docs/plan-linux-service.md).
+
 on:
   push:
     tags:
@@ -12,130 +16,27 @@ env:
 
 jobs:
   release:
-    name: Cross build for ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            exe: rathole-x
-            cross: false
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            exe: rathole-x
-            cross: false
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-            exe: rathole-x
-            cross: true
-          - os: ubuntu-latest
-            target: arm-unknown-linux-musleabi
-            exe: rathole-x
-            cross: true
-          - os: ubuntu-latest
-            target: arm-unknown-linux-musleabihf
-            exe: rathole-x
-            cross: true
-          - os: ubuntu-latest
-            target: armv7-unknown-linux-musleabihf
-            exe: rathole-x
-            cross: true
-          - os: ubuntu-latest
-            target: mips-unknown-linux-gnu
-            exe: rathole-x
-            cross: true
-          - os: ubuntu-latest
-            target: mips-unknown-linux-musl
-            exe: rathole-x
-            cross: true
-          - os: ubuntu-latest
-            target: mipsel-unknown-linux-gnu
-            exe: rathole-x
-            cross: true
-          - os: ubuntu-latest
-            target: mipsel-unknown-linux-musl
-            exe: rathole-x
-            cross: true
-          - os: ubuntu-latest
-            target: mips64-unknown-linux-gnuabi64
-            exe: rathole-x
-            cross: true
-          - os: ubuntu-latest
-            target: mips64el-unknown-linux-gnuabi64
-            exe: rathole-x
-            cross: true
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            exe: rathole-x
-            cross: false
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            exe: rathole-x
-            cross: false
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            exe: rathole-x.exe
-            cross: false
+    name: Build Windows release
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Install OpenSSL
-        if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get install pkg-config libssl-dev
-      - name: Install OpenSSL
-        if: matrix.os == 'macos-latest'
-        run: brew install openssl@3
-
-      # Native build
-      - name: Install target
-        if: matrix.cross == false
-        run: rustup target add ${{ matrix.target }}
       - name: Run tests
-        if: matrix.cross == false && matrix.target != 'aarch64-apple-darwin'
-        run: cargo test --release --target ${{ matrix.target }} --verbose
-      - name: Build release
-        if: matrix.cross == false
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo test --release --target x86_64-pc-windows-msvc --verbose
 
-      # Cross build
-      - name: Install cross
-        if: matrix.cross
-        run: cargo install --version 0.2.5 cross
-      - name: Run tests
-        if: matrix.cross
-        run: cross test --release --target ${{ matrix.target }} --verbose --features embedded --no-default-features
       - name: Build release
-        if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }} --features embedded --no-default-features
+        run: cargo build --release --target x86_64-pc-windows-msvc
 
-      - name: Run UPX
-        # Upx may not support some platforms. Ignore the errors
-        continue-on-error: true
-        # Disable upx for mips. See https://github.com/upx/upx/issues/387
-        if: matrix.os == 'ubuntu-latest' && !contains(matrix.target, 'mips')
-        uses: crazy-max/ghaction-upx@v1
-        with:
-          version: v4.0.2
-          files: target/${{ matrix.target }}/release/${{ matrix.exe }}
-          args: -q --best --lzma
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rathole-x-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ matrix.exe }}
-      - name: Zip Release (Linux/macOS)
-        if: runner.os != 'Windows'
-        working-directory: target/${{ matrix.target }}/release
-        run: zip rathole-x-${{ matrix.target }}.zip ${{ matrix.exe }}
-      - name: Zip Release (Windows)
-        if: runner.os == 'Windows'
+      - name: Zip release
         shell: pwsh
-        run: Compress-Archive -Path target/${{ matrix.target }}/release/${{ matrix.exe }} -DestinationPath target/${{ matrix.target }}/release/rathole-x-${{ matrix.target }}.zip
-      - name: Publish
+        run: Compress-Archive -Path target/x86_64-pc-windows-msvc/release/rathole-x.exe -DestinationPath rathole-x-x86_64-pc-windows-msvc.zip
+
+      - name: Publish draft release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: target/${{ matrix.target }}/release/rathole-x-${{ matrix.target }}.zip
+          files: rathole-x-x86_64-pc-windows-msvc.zip
           generate_release_notes: true
           draft: true
