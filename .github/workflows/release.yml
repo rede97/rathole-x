@@ -3,6 +3,10 @@ name: Release
 # Windows-only for now. The full cross-platform matrix was deliberately
 # reduced: Linux/macOS/ARM targets can be restored once systemd support
 # lands (see docs/plan-linux-service.md).
+#
+# Two publish paths:
+# 1. push of a tag `v*` -> automatic draft release with the Windows zip
+# 2. manual dispatch with an existing tag name -> same, via gh CLI
 
 on:
   push:
@@ -10,6 +14,11 @@ on:
       - "*"
 
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish (fallback when not triggered by a tag push)"
+        required: false
+        default: ""
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,10 +42,23 @@ jobs:
         shell: pwsh
         run: Compress-Archive -Path target/x86_64-pc-windows-msvc/release/rathole-x.exe -DestinationPath rathole-x-x86_64-pc-windows-msvc.zip
 
-      - name: Publish draft release
-        uses: softprops/action-gh-release@v2
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rathole-x-x86_64-pc-windows-msvc
+          path: rathole-x-x86_64-pc-windows-msvc.zip
+
+      - name: Publish draft (tag push)
         if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
         with:
           files: rathole-x-x86_64-pc-windows-msvc.zip
           generate_release_notes: true
           draft: true
+
+      - name: Publish draft (manual dispatch)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.event.inputs.tag }}" --draft --generate-notes rathole-x-x86_64-pc-windows-msvc.zip || gh release upload "${{ github.event.inputs.tag }}" rathole-x-x86_64-pc-windows-msvc.zip --clobber
