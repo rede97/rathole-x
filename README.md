@@ -15,6 +15,95 @@ A secure, stable and high-performance reverse proxy for NAT traversal, written i
 
 rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.com/inconshreveable/ngrok), can help to expose the service on the device behind the NAT to the Internet, via a server with a public IP.
 
+# rathole-x (fork)
+
+`rathole-x` is an enhanced fork of [rathole](https://github.com/rapiz1/rathole) that keeps the **wire protocol 100% upstream-compatible** — upstream rathole clients and servers interoperate with `rathole-x` — while adding a subcommand-driven CLI, zero-config-file-handcrafting workflows, and deeper platform integration. The binary name is `rathole-x`.
+
+## Design philosophy
+
+- **One binary, subcommand-driven CLI.** Human-friendly: interactive prompts plus auto-generated tokens and noise keys. Agent-friendly: everything is available as flags, with `--json` output and a `--yes` non-interactive mode.
+- **Zero config-file handcrafting.** `install` deploys a system service with a unified empty default config (a silent client with no services); `config add`/`config set` manage everything; hot reload applies changes without restarting.
+- **One process runs both server and client** when the config has both `[server]` and `[client]` sections.
+- **Upstream-compatible wire protocol.** `rathole-x` speaks the same wire protocol as upstream rathole, so the two interoperate.
+- **Platform integration.** Windows SCM service plus UAC elevation; Linux systemd is planned (see [docs/plan-linux-service.md](docs/plan-linux-service.md)).
+- **Secure defaults.** Tokens are mandatory; config edits are gated by the actual file permissions — the CLI probes whether the current user can write the config and elevates (UAC) only when not; the service binary is copied into `ProgramData` and is not replaceable by non-admins.
+
+## New features over upstream
+
+- **Subcommand-driven CLI** — `run` (run the daemon), `config add|remove|list|set` (manage the service configuration), `status` (service state + config tree), `genkey` (generate a noise keypair), `install` (install as a system service), `uninstall` (uninstall the service). See [CLI reference](#cli-reference) for flags.
+- **Dual mode** — one process runs both server and client when the config has both sections.
+- **Auto-generated tokens and noise keys** — `config add`/`config set` generate them when omitted.
+- **Hot reload via atomic writes** — `config add`/`config set`/`config remove` rewrite the config atomically; the running service hot-reloads it without a restart.
+- **Windows service install** — `install server|client --name <n>` registers a named SCM service (AutoStart) with its own config file; the binary is copied next to the configs and is not replaceable by non-admins; an `uninstall-<n>.bat` is written per service; whether non-admin users may edit a config is decided by its actual permissions (no policy file).
+- **Status tree view** — `status` prints the service state plus the config tree (`--json` for scripts).
+- **Default config auto-creation** — `install` creates a unified empty default config when none exists.
+
+## Quick start (Windows)
+
+1. Install the service from an elevated shell. `--yes` is mandatory: without it, only the usage is printed. A unified empty default config is created if missing, the binary is copied next to the config, and a Windows SCM service (AutoStart) is registered with UAC elevation:
+
+```bash
+./rathole-x install --yes
+```
+
+2. Add a service. The demo below exposes a NAS ssh service: the same name pairs the server and client sides, and tokens are auto-generated:
+
+```bash
+# Server (public IP): expose port 5202 to the Internet
+./rathole-x config add --server "name:my_nas_ssh;bind:0.0.0.0:5202"
+
+# Client (behind NAT): forward to the NAS ssh daemon on port 22
+./rathole-x config add --client "server:myserver.com:2333;name:my_nas_ssh;local:127.0.0.1:22"
+```
+
+3. Check the service state and the configuration tree:
+
+```bash
+./rathole-x status
+```
+
+4. Uninstall the service. `version.toml` is removed with the last service; the config file is kept unless `--purge` is passed:
+
+```bash
+./rathole-x uninstall --yes
+```
+
+> **Linux systemd** service support is planned — see [docs/plan-linux-service.md](docs/plan-linux-service.md).
+
+## Service lifecycle
+
+- `rathole-x service start|stop|restart [--name N | --all]` — drive the SCM state of installed services (UAC elevated when needed).
+- `rathole-x upgrade --yes` — update the installed binary in place: stops every service, replaces the shared binary with the running one, starts them again.
+- `rathole-x uninstall --yes --all` — remove every installed service, all configs and the shared binary.
+- A normal `uninstall --yes` leaves the kept config user-deletable, and uninstalling an already-removed service cleans leftover files WITHOUT elevation.
+
+## Config schema versioning
+
+The `version.toml` file (written by `install`) stamps the **major version** of the rathole-x build that installed the service. `config add`/`config set`/`config remove` refuse to touch a config whose stamped major version differs from the running CLI:
+
+```
+This config is managed by rathole-x v0 but this CLI is v1.
+Reinstall the service to upgrade: `rathole-x uninstall --yes` then `rathole-x install --yes`.
+```
+
+Read-only commands (`status`, `list`, `run`) and `install`/`uninstall` are never blocked. Configs without a policy file (user-managed files) have no stamp and no restriction.
+
+**Rule for developers: any breaking config schema change (renamed/removed/retagged fields, changed semantics or defaults) MUST bump the major version.** Purely additive changes (new optional fields with serde defaults) do not require one. The stamp lives in `version.toml`, so the rathole config file itself stays 100% parseable by upstream rathole.
+
+## CLI reference
+
+Every subcommand accepts `--json` for machine-readable output; `install` and `uninstall` require `--yes` to confirm. The upstream positional `./rathole config.toml` form is **not supported** in this fork — run the daemon with `run -c CONFIG` (with no `-c`, the OS default path is used: Windows `%ProgramData%\rathole-x\rathole-x.toml`, Linux `/etc/rathole-x.toml`).
+
+- `run [-c CONFIG] [--server|--client]` — run the daemon; `--server`/`--client` force a mode.
+- `add [<NAME>] [--client SPEC]... [--server SPEC]... [--remote-addr A] [--bind-addr A] [--local-addr A] [--token T] [--noise] [--noise-key K] [--type tcp|udp] [-c] [--json] [--yes]` — add services by name and flags, or in batches via repeatable `--client "server:...;name:...;local:...;token:...;type:..."` / `--server "name:...;bind:...;token:...;type:..."` specs (one write, one hot-reload). Without a name in a TTY it runs a multi-round interactive wizard (empty name finishes). Client specs accept a `server:` key: it sets the [client] default on a fresh section, or a per-service override otherwise (a client may connect to several servers).
+- `remove <NAME> [-c] [--json]` — remove a service.
+- `list [-c] [--json]` — list services.
+- `set <--client|--server> [global fields] [-c] [--json]` — set global fields: `--remote-addr`, `--bind-addr`, `--default-token`, `--prefer-ipv6`, `--heartbeat-timeout`, `--retry-interval`, `--heartbeat-interval`, `--transport tcp|tls|noise|websocket`, `--noise`, `--noise-key`, `--trusted-root`, `--hostname`, `--pkcs12`, `--pkcs12-password`, `--ws-tls`, `--nodelay`, `--keepalive-secs`, `--keepalive-interval`, `--proxy`.
+- `status [-c] [--json]` — print the service state plus the config tree.
+- `genkey [--curve x25519|x448]` — generate a noise keypair.
+- `install --yes [-c] [--name] [--allow-user-config]` — install as a system service: creates a default config if missing, copies the binary next to the config, writes `uninstall.bat`, and registers a Windows SCM service (AutoStart) with UAC. Without `--yes`, only the usage is printed.
+- `uninstall --yes [--name N] [--purge]` — uninstall the named service; `version.toml` is removed with the last service and the config is kept unless `--purge`.
+
 <!-- TOC -->
 
 - [rathole](#rathole)
@@ -25,6 +114,7 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
     - [Tuning](#tuning)
   - [Benchmark](#benchmark)
   - [Planning](#planning)
+- [rathole-x (fork)](#rathole-x-fork)
 
 <!-- /TOC -->
 
@@ -34,6 +124,59 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 - **Low Resource Consumption** Consumes much fewer memory than similar tools. See [Benchmark](#benchmark). [The binary can be](docs/build-guide.md) **as small as ~500KiB** to fit the constraints of devices, like embedded devices as routers.
 - **Security** Tokens of services are mandatory and service-wise. The server and clients are responsible for their own configs. With the optional Noise Protocol, encryption can be configured at ease. No need to create a self-signed certificate! TLS is also supported.
 - **Hot Reload** Services can be added or removed dynamically by hot-reloading the configuration file. HTTP API is WIP.
+
+
+## CLI quick start (rathole-x)
+
+The `rathole-x` binary is fully subcommand-based; running it bare prints the help. Start the daemon with `run -c` (the upstream positional `./rathole config.toml` form is not supported in this fork).
+
+```bash
+# Add a service by name; tokens are auto-generated when omitted.
+./rathole-x config add --client "server:myserver.com:2333;name:my_nas_ssh;local:127.0.0.1:22"
+
+# Tune [client]/[server] global fields and transports without editing the file
+./rathole-x config set --server --bind-addr 0.0.0.0:2333 --noise            # generates a noise keypair
+./rathole-x config set --client --remote-addr myserver.com:2333 --noise-key <SERVER_PUBLIC_KEY>
+./rathole-x config set --server --transport tls --pkcs12 identity.pfx --pkcs12-password 1234
+./rathole-x config set --client --default-token shared --heartbeat-timeout 60
+
+# Show the service state and configuration as a tree (--json for scripts)
+./rathole-x status
+./rathole-x status --json
+
+# Inspect and edit the config it maintains
+./rathole-x config list -c config.toml
+./rathole-x config remove my_nas_ssh -c config.toml
+
+# Interactive prompts are used when flags are missing and a TTY is present;
+# scripts can pass every flag and read machine-readable output with --json.
+./rathole-x config add --client "server:myserver.com:2333;name:my_nas_ssh;local:127.0.0.1:22" --json
+
+# Named server profiles (CLI sugar; resolved to concrete addresses at write
+# time so the config file stays upstream-compatible):
+./rathole-x config add --remote "name:default;server:srv-a.com:2333" --remote "name:backup;server:srv-b.com:2333" \
+  --client "remote:default;name:nas;local:127.0.0.1:22" \
+  --client "remote:backup;name:db;local:127.0.0.1:5432"
+
+# Generate a noise keypair (replaces the removed --genkey flag)
+./rathole-x genkey
+
+# Run one process that serves both [server] and [client] sections at once
+./rathole-x run -c config.toml
+# Install named services: exactly one role per service, one config file per
+# service. A role-specific skeleton config is created automatically.
+./rathole-x install server --yes --name relay
+./rathole-x install client --yes --name home-nas
+
+# Grant normal users write access to the config: the CLI detects the
+# permission at runtime and skips UAC. No policy file is stored.
+./rathole-x install server --yes --name relay --allow-user-config
+
+# Uninstall: version.toml is removed with the last service; the config file
+# is kept unless --purge is given.
+./rathole-x uninstall --yes --name relay
+./rathole-x uninstall --yes --purge --name home-nas
+```
 
 ## Quickstart
 

@@ -10,6 +10,10 @@ readme = "README.md"
 build = "build.rs"
 include = ["src/**/*", "LICENSE", "README.md", "build.rs"]
 
+[[bin]]
+name = "rathole-x"
+path = "src/main.rs"
+
 [features]
 default = [
     "server",
@@ -115,6 +119,9 @@ async-http-proxy = { version = "1.2", features = [
     "basic-auth",
 ] }
 async-socks5 = "0.5"
+toml_edit = { version = "0.22", features = ["serde"] }
+serde_json = "1.0"
+dialoguer = "0.11"
 url = { version = "2.2", features = ["serde"] }
 tokio-tungstenite = { version = "0.20.1", optional = true }
 tokio-util = { version = "0.7.9", optional = true, features = ["io"] }
@@ -132,7 +139,19 @@ openssl = { version = "0.10", features = ["vendored"], optional = true }
 [build-dependencies]
 vergen = { version = "7.4.2", default-features = false, features = [
     "build",
-    "git",
     "cargo",
 ] }
 anyhow = "1.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+tracing-appender = "0.2"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

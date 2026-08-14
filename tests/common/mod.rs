@@ -15,9 +15,11 @@ pub async fn run_rathole_server(
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let cli = rathole::Cli {
-        config_path: Some(PathBuf::from(config_path)),
-        server: true,
-        client: false,
+        command: Some(rathole::Commands::Run(rathole::RunArgs {
+            config: Some(PathBuf::from(config_path)),
+            server: true,
+            ..Default::default()
+        })),
         ..Default::default()
     };
     rathole::run(cli, shutdown_rx).await
@@ -28,9 +30,11 @@ pub async fn run_rathole_client(
     shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let cli = rathole::Cli {
-        config_path: Some(PathBuf::from(config_path)),
-        server: false,
-        client: true,
+        command: Some(rathole::Commands::Run(rathole::RunArgs {
+            config: Some(PathBuf::from(config_path)),
+            client: true,
+            ..Default::default()
+        })),
         ..Default::default()
     };
     rathole::run(cli, shutdown_rx).await

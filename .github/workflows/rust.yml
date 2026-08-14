@@ -20,12 +20,11 @@ jobs:
     name: Lints
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
           components: clippy
-      - uses: Swatinem/rust-cache@v1
+      - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy -- -D warnings
       - name: Setup cargo-hack
@@ -42,24 +41,22 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            exe: rathole
+            exe: rathole-x
             target: x86_64-unknown-linux-gnu
           - os: windows-latest
-            exe: rathole.exe
+            exe: rathole-x.exe
             target: x86_64-pc-windows-msvc
           - os: macos-latest
-            exe: rathole
+            exe: rathole-x
             target: x86_64-apple-darwin
           - os: macos-latest
-            exe: rathole
+            exe: rathole-x
             target: aarch64-apple-darwin
 
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-      - uses: Swatinem/rust-cache@v1
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build
       - name: Run tests with native-tls
@@ -68,5 +65,5 @@ jobs:
         run: cargo test --verbose --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
       - uses: actions/upload-artifact@v4
         with:
-          name: rathole-${{ matrix.target }}
+          name: rathole-x-${{ matrix.target }}
           path: target/debug/${{ matrix.exe }}

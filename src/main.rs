@@ -7,7 +7,11 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Cli::parse();
-
+    // The UAC elevation relay: the elevated child runs hidden and writes all
+    // its output into a log file that the waiting parent replays.
+    if let Some(path) = &args.elevated_log {
+        rathole::platform::redirect_stdio_to_file(path);
+    }
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
     tokio::spawn(async move {
         if let Err(e) = signal::ctrl_c().await {
@@ -43,3 +47,5 @@ async fn main() -> Result<()> {
 
     run(args, shutdown_rx).await
 }
+
+

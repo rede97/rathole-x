@@ -63,6 +63,11 @@ pub struct ClientServiceConfig {
     #[serde(skip)]
     pub name: String,
     pub local_addr: String,
+    /// Control channel address override: this service connects to a
+    /// different server than [client] remote_addr. None = use the global
+    /// remote_addr.
+    #[serde(default)]
+    pub remote_addr: Option<String>,
     #[serde(default)] // Default to false
     pub prefer_ipv6: bool,
     pub token: Option<MaskedString>,
