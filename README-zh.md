@@ -39,7 +39,7 @@ rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://g
 
 ## Quick start (Windows)
 
-1. 从已提权的 shell 安装服务。`--yes` 为必填：缺少它只会打印用法。若缺少配置文件则自动创建角色专属的骨架配置，二进制被复制到配置旁，并以 UAC 提权注册一个 Windows SCM 服务（AutoStart）：
+1. 从已提权的 shell 安装服务。安装前会弹出交互式确认（传入 `--yes` 可跳过；非交互 shell 不传 `--yes` 时只会打印用法）。若缺少配置文件则自动创建角色专属的骨架配置，二进制被复制到配置旁，并以 UAC 提权注册一个 Windows SCM 服务（AutoStart）：
 
 ```bash
 # 服务端（公网 IP）
@@ -146,7 +146,7 @@ Reinstall the service to upgrade: `rathole-x service uninstall --yes` then `rath
 
 ## CLI reference
 
-`config add|remove|list|set` 与 `status` 接受 `--json` 以获得机器可读输出；`service install`、`service uninstall` 与 `upgrade` 需要 `--yes` 来确认。上游的位置参数形式 `./rathole config.toml` 在本分支中**不受支持**——用 `run -c CONFIG` 运行守护进程（不带 `-c` 时使用系统默认路径：Windows 为 `%ProgramData%\rathole-x\rathole-x.toml`，Linux 为 `/etc/rathole-x.toml`）。带 `--name` 的命令操作同名的已安装服务；同时省略 `--name` 与 `-c` 且恰好只安装了一个服务时，自动使用该服务。
+`config add|remove|list|set` 与 `status` 接受 `--json` 以获得机器可读输出；`service install`、`service uninstall` 与 `upgrade` 在运行前确认——TTY 下弹交互式确认，`--yes`（或 `RATHOLE_X_CONFIRMED=1`）跳过确认，非交互 shell 不传 `--yes` 时只打印用法。上游的位置参数形式 `./rathole config.toml` 在本分支中**不受支持**——用 `run -c CONFIG` 运行守护进程（不带 `-c` 时使用系统默认路径：Windows 为 `%ProgramData%\rathole-x\rathole-x.toml`，Linux 为 `/etc/rathole-x.toml`）。带 `--name` 的命令操作同名的已安装服务；同时省略 `--name` 与 `-c` 且恰好只安装了一个服务时，自动使用该服务。
 
 - `run [-c CONFIG] [--server|--client]` — 运行守护进程；`--server`/`--client` 强制指定模式。双段配置在单进程中同时运行两段。
 - `config add [<NAME>] [--client SPEC]... [--server SPEC]... [--remote-addr A] [--bind-addr A] [--local-addr A] [--token T] [--noise] [--noise-key K] [--type tcp|udp] [-c] [--name N] [--json] [--yes]` — 按名称和 flag 添加服务，或通过可重复的 `--client "server:...;name:...;local:...;token:...;type:..."` / `--server "name:...;bind:...;token:...;type:..."` 规格批量添加（一次写入、一次热重载）。在 TTY 中不指定名称时，会运行多轮交互式向导（空名称结束）。一个 client 配置只连接一个服务器（与上游一致）：规格的 `server:` 键在全新段上设置 `[client] remote_addr` 默认值；段已存在时必须与其一致——要使用另一台服务器，请安装独立的服务实例（`service install client --name <N>`）。
@@ -155,7 +155,7 @@ Reinstall the service to upgrade: `rathole-x service uninstall --yes` then `rath
 - `config set <--client|--server> [global fields] [-c] [--name N] [--json]` — 设置全局字段：`--remote-addr`、`--bind-addr`、`--default-token`、`--prefer-ipv6`、`--heartbeat-timeout`、`--retry-interval`、`--heartbeat-interval`、`--transport tcp|tls|noise|websocket`、`--noise`、`--noise-key`、`--trusted-root`、`--hostname`、`--pkcs12`、`--pkcs12-password`、`--ws-tls`、`--nodelay`、`--keepalive-secs`、`--keepalive-interval`、`--proxy`。
 - `status [-c] [--name N] [--json]` — 打印服务状态与配置树；无参数列出全部服务，`--name N` 查看单服务，`--json` 供脚本使用。
 - `genkey [--curve x25519|x448]` — 生成 noise 密钥对。
-- `service install <server|client> --yes [-c] [--name N] [--allow-user-config]` — 安装系统服务（二选一角色）：缺失时创建角色骨架配置、将二进制复制到配置旁、写入 `uninstall-<N>.bat`，并以 UAC 注册 Windows SCM 服务（AutoStart）。`--name` 缺省为 "default"。缺少 `--yes` 时仅打印用法。
+- `service install <server|client> --yes [-c] [--name N] [--allow-user-config]` — 安装系统服务（二选一角色）：缺失时创建角色骨架配置、将二进制复制到配置旁、写入 `uninstall-<N>.bat`，并以 UAC 注册 Windows SCM 服务（AutoStart）。`--name` 缺省为 "default"。交互式确认后运行；`--yes` 跳过确认（非交互 shell 必传）。
 - `service uninstall --yes [--name N] [-c] [--purge] [--all]` — 卸载命名服务；`--all` 全量清除（所有服务、全部配置与共享二进制）；最后一个服务被移除时 `version.toml` 一并删除，除非 `--purge`，否则配置保留。
 - `service start|stop|restart [--name N | --all]` — 驱动已安装服务的 SCM 状态（需要时 UAC 提权）。
 - `upgrade --yes` — 原地更新已安装的二进制：停止所有服务、用当前运行的二进制替换共享二进制、再重新启动它们。

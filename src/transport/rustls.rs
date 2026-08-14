@@ -113,7 +113,15 @@ impl Transport for TlsTransport {
             .as_ref()
             .ok_or_else(|| anyhow!("Missing tls config"))?;
 
-        let connector = load_client_config(config)?.map(|c| Arc::new(c).into());
+        // A client always needs a connector. A server-only setup (pkcs12
+        // configured, no trusted_root) skips loading client roots here so it
+        // also starts on hosts without a native CA store; if that transport
+        // is ever used as a client, `connect` builds the connector on demand
+        // and surfaces the real error.
+        let connector = match (&config.trusted_root, &config.pkcs12) {
+            (None, Some(_)) => None,
+            _ => load_client_config(config)?.map(|c| Arc::new(c).into()),
+        };
         let tls_acceptor = load_server_config(config)?.map(|c| Arc::new(c).into());
 
         Ok(TlsTransport {
@@ -155,10 +163,19 @@ impl Transport for TlsTransport {
     async fn connect(&self, addr: &AddrMaybeCached) -> Result<Self::Stream> {
         let conn = self.tcp.connect(addr).await?;
 
-        let connector = self
-            .connector
-            .as_ref()
-            .ok_or_else(|| anyhow!("No tls client config available for running as a client"))?;
+        // Server-only transports reach this point without a connector; build
+        // it now so the failure names the real cause (missing roots etc.)
+        // instead of a vague "no client config".
+        let built;
+        let connector = match self.connector.as_ref() {
+            Some(c) => c,
+            None => {
+                let client_config = load_client_config(&self.config)?
+                    .ok_or_else(|| anyhow!("No tls client config available for running as a client"))?;
+                built = Arc::new(client_config).into();
+                &built
+            }
+        };
 
         let host_name = self
             .config

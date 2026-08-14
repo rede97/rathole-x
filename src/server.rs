@@ -759,6 +759,10 @@ async fn run_udp_connection_pool<T: Transport>(
                         // only a dead data channel justifies a rebuild.
                         Err(e) => {
                             warn!("Failed to receive inbound traffic (ignored): {:#}", e);
+                            // A persistent error (e.g. the interface is
+                            // gone) returns immediately from every recv —
+                            // back off instead of spinning the loop hot.
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
                     }
                 },

@@ -40,7 +40,7 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 
 ## Quick start (Windows)
 
-1. Install the services from an elevated shell — one named service per role; to run both server and client on a host, install two services. `--yes` is mandatory: without it, only the usage is printed. A role skeleton config is created if missing, the binary is copied next to the configs, and a Windows SCM service (AutoStart) is registered with UAC elevation:
+1. Install the services from an elevated shell — one named service per role; to run both server and client on a host, install two services. You will be asked to confirm (or pass `--yes` to skip; non-interactive shells get the usage unless `--yes` is passed). A role skeleton config is created if missing, the binary is copied next to the configs, and a Windows SCM service (AutoStart) is registered with UAC elevation:
 
 ```bash
 # Server (public IP)
@@ -97,7 +97,7 @@ Read-only commands (`status`, `list`, `run`) and `install`/`uninstall` are never
 
 ## CLI reference
 
-`config add|remove|list|set` and `status` accept `--json` for machine-readable output; `service install`, `service uninstall` and `upgrade` require `--yes` to confirm. The upstream positional `./rathole config.toml` form is **not supported** in this fork — run the daemon with `run -c CONFIG` (with no `-c`, the OS default path is used: Windows `%ProgramData%\rathole-x\rathole-x.toml`, Linux `/etc/rathole-x.toml`). Commands with `--name` target the installed service of that name; when both `--name` and `-c` are omitted and exactly one service is installed, that one is used.
+`config add|remove|list|set` and `status` accept `--json` for machine-readable output; `service install`, `service uninstall` and `upgrade` confirm before running — a TTY shows an interactive prompt, `--yes` (or `RATHOLE_X_CONFIRMED=1`) skips it, and a non-interactive shell without `--yes` only prints the usage. The upstream positional `./rathole config.toml` form is **not supported** in this fork — run the daemon with `run -c CONFIG` (with no `-c`, the OS default path is used: Windows `%ProgramData%\rathole-x\rathole-x.toml`, Linux `/etc/rathole-x.toml`). Commands with `--name` target the installed service of that name; when both `--name` and `-c` are omitted and exactly one service is installed, that one is used.
 
 - `run [-c CONFIG] [--server|--client]` — run the daemon; `--server`/`--client` force a mode. A dual-section config runs both halves in one process.
 - `config add [<NAME>] [--client SPEC]... [--server SPEC]... [--remote-addr A] [--bind-addr A] [--local-addr A] [--token T] [--noise] [--noise-key K] [--type tcp|udp] [-c] [--name N] [--json] [--yes]` — add services by name and flags, or in batches via repeatable `--client "server:...;name:...;local:...;token:...;type:..."` / `--server "name:...;bind:...;token:...;type:..."` specs (one write, one hot-reload). Without a name in a TTY it runs a multi-round interactive wizard (empty name finishes). One client config connects to exactly one server (upstream model): the spec's `server:` key sets the `[client] remote_addr` default on a fresh section, and must match it when the section already exists — to use another server, install a separate service instance (`service install client --name <N>`).
@@ -106,7 +106,7 @@ Read-only commands (`status`, `list`, `run`) and `install`/`uninstall` are never
 - `config set <--client|--server> [global fields] [-c] [--name N] [--json]` — set global fields: `--remote-addr`, `--bind-addr`, `--default-token`, `--prefer-ipv6`, `--heartbeat-timeout`, `--retry-interval`, `--heartbeat-interval`, `--transport tcp|tls|noise|websocket`, `--noise`, `--noise-key`, `--trusted-root`, `--hostname`, `--pkcs12`, `--pkcs12-password`, `--ws-tls`, `--nodelay`, `--keepalive-secs`, `--keepalive-interval`, `--proxy`.
 - `status [-c] [--name N] [--json]` — print the service state plus the config tree; without `--name` every installed service is listed.
 - `genkey [--curve x25519|x448]` — generate a noise keypair.
-- `service install <server|client> --yes [-c] [--name N] [--allow-user-config]` — install a system service (exactly one role): creates a role skeleton config if missing, copies the binary next to the config, writes `uninstall-<N>.bat`, and registers a Windows SCM service (AutoStart) with UAC. `--name` defaults to "default". Without `--yes`, only the usage is printed.
+- `service install <server|client> --yes [-c] [--name N] [--allow-user-config]` — install a system service (exactly one role): creates a role skeleton config if missing, copies the binary next to the config, writes `uninstall-<N>.bat`, and registers a Windows SCM service (AutoStart) with UAC. `--name` defaults to "default". Runs after an interactive confirmation; `--yes` skips it (required in non-interactive shells).
 - `service uninstall --yes [--name N] [-c] [--purge] [--all]` — uninstall the named service; `--all` removes every installed service, all configs and the shared binary. `version.toml` is removed with the last service and the config is kept unless `--purge`.
 - `service start|stop|restart [--name N | --all]` — drive the SCM state of installed services (UAC elevated when needed).
 - `upgrade --yes` — stop every service, replace the shared binary with the running one, start them again.

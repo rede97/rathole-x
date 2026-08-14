@@ -1084,7 +1084,6 @@ fn ensure_role_allows(doc: &DocumentMut, requested: ServiceSide) -> Result<()> {
     Ok(())
 }
 
-/// Parse a --remote profile spec: "name:<id>;server:<host:port>".
 /// Parse one compact spec: "key:value;key:value;...".
 /// Client keys: name, server, local, token, type.
 /// Server keys: name, bind, token, type.
@@ -1467,7 +1466,12 @@ fn insert_pending(doc: &mut DocumentMut, p: PendingService) -> Result<Value> {
 }
 
 /// Save the doc, prepending the skeleton when the file was just created.
+///
+/// The result is validated with the runtime rules before it touches the
+/// disk: every `config add` path funnels through here, and a config the
+/// watcher would silently reject must never be reported as added.
 fn save_with_skeleton(path: &Path, doc: &DocumentMut, created: bool) -> Result<()> {
+    crate::config::Config::validate(&doc.to_string())?;
     if created {
         write_atomic(path, &format!("{}\n{}", CONFIG_SKELETON, doc))
             .with_context(|| format!("Failed to write {}", path.display()))?;
