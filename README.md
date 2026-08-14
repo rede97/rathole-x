@@ -34,7 +34,7 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 - **Dual mode** — one process runs both server and client when the config has both sections.
 - **Auto-generated tokens and noise keys** — `config add`/`config set` generate them when omitted.
 - **Hot reload via atomic writes** — `config add`/`config set`/`config remove` rewrite the config atomically; the running service hot-reloads it without a restart.
-- **Windows service install** — `install server|client --name <n>` registers a named SCM service (AutoStart) with its own config file; the binary is copied next to the configs and is not replaceable by non-admins; an `uninstall-<n>.bat` is written per service; whether non-admin users may edit a config is decided by its actual permissions (no policy file).
+- **Windows service install** — `service install server|client --name <n>` registers a named SCM service (AutoStart) with its own config file; the binary is copied next to the configs and is not replaceable by non-admins; an `uninstall-<n>.bat` is written per service; whether non-admin users may edit a config is decided by its actual permissions (no policy file).
 - **Status tree view** — `status` prints the service state plus the config tree (`--json` for scripts).
 - **Default config auto-creation** — `install` creates a unified empty default config when none exists.
 
@@ -65,7 +65,7 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 4. Uninstall the service. `version.toml` is removed with the last service; the config file is kept unless `--purge` is passed:
 
 ```bash
-./rathole-x uninstall --yes
+./rathole-x service uninstall --yes
 ```
 
 > **Linux systemd** service support is planned — see [docs/plan-linux-service.md](docs/plan-linux-service.md).
@@ -74,8 +74,8 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 
 - `rathole-x service start|stop|restart [--name N | --all]` — drive the SCM state of installed services (UAC elevated when needed).
 - `rathole-x upgrade --yes` — update the installed binary in place: stops every service, replaces the shared binary with the running one, starts them again.
-- `rathole-x uninstall --yes --all` — remove every installed service, all configs and the shared binary.
-- A normal `uninstall --yes` leaves the kept config user-deletable, and uninstalling an already-removed service cleans leftover files WITHOUT elevation.
+- `rathole-x service uninstall --yes --all` — remove every installed service, all configs and the shared binary.
+- A normal `service uninstall --yes` leaves the kept config user-deletable, and uninstalling an already-removed service cleans leftover files WITHOUT elevation.
 
 ## Config schema versioning
 
@@ -83,7 +83,7 @@ The `version.toml` file (written by `install`) stamps the **major version** of t
 
 ```
 This config is managed by rathole-x v0 but this CLI is v1.
-Reinstall the service to upgrade: `rathole-x uninstall --yes` then `rathole-x install --yes`.
+Reinstall the service to upgrade: `rathole-x service uninstall --yes` then `rathole-x service install <server|client> --yes`.
 ```
 
 Read-only commands (`status`, `list`, `run`) and `install`/`uninstall` are never blocked. Configs without a policy file (user-managed files) have no stamp and no restriction.
@@ -103,6 +103,12 @@ Every subcommand accepts `--json` for machine-readable output; `install` and `un
 - `genkey [--curve x25519|x448]` — generate a noise keypair.
 - `install --yes [-c] [--name] [--allow-user-config]` — install as a system service: creates a default config if missing, copies the binary next to the config, writes `uninstall.bat`, and registers a Windows SCM service (AutoStart) with UAC. Without `--yes`, only the usage is printed.
 - `uninstall --yes [--name N] [--purge]` — uninstall the named service; `version.toml` is removed with the last service and the config is kept unless `--purge`.
+
+---
+
+> 以下是以前的 README(原版 rathole 文档)
+
+---
 
 <!-- TOC -->
 
@@ -165,17 +171,17 @@ The `rathole-x` binary is fully subcommand-based; running it bare prints the hel
 ./rathole-x run -c config.toml
 # Install named services: exactly one role per service, one config file per
 # service. A role-specific skeleton config is created automatically.
-./rathole-x install server --yes --name relay
-./rathole-x install client --yes --name home-nas
+./rathole-x service install server --yes --name relay
+./rathole-x service install client --yes --name home-nas
 
 # Grant normal users write access to the config: the CLI detects the
 # permission at runtime and skips UAC. No policy file is stored.
-./rathole-x install server --yes --name relay --allow-user-config
+./rathole-x service install server --yes --name relay --allow-user-config
 
 # Uninstall: version.toml is removed with the last service; the config file
 # is kept unless --purge is given.
-./rathole-x uninstall --yes --name relay
-./rathole-x uninstall --yes --purge --name home-nas
+./rathole-x service uninstall --yes --name relay
+./rathole-x service uninstall --yes --purge --name home-nas
 ```
 
 ## Quickstart

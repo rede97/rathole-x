@@ -81,11 +81,6 @@ pub enum Commands {
     /// Show the service state and the configuration as a tree
     Status(StatusArgs),
 
-    /// Install rathole-x as a system service
-    Install(Box<InstallArgs>),
-
-    /// Uninstall the rathole-x system service
-    Uninstall(Box<UninstallArgs>),
     /// Start, stop or restart an installed service
     Service {
         #[clap(subcommand)]
@@ -94,13 +89,6 @@ pub enum Commands {
 
     /// Update the installed binary in place (stop, replace, start)
     Upgrade(UpgradeArgs),
-
-    /// Entry point used by the Windows service manager. Not for interactive use
-    ServiceRun {
-        /// The configuration file the service runs with
-        #[clap(long, parse(from_os_str))]
-        config: PathBuf,
-    },
 }
 
 /// Subcommands of `rathole-x config`: service and global field management.
@@ -485,12 +473,24 @@ pub struct SetArgs {
 /// Actions of `rathole-x service`.
 #[derive(Subcommand, Debug, Clone)]
 pub enum ServiceCmd {
+    /// Install a service (exactly one role: server or client)
+    Install(InstallArgs),
+    /// Uninstall a service (or every service with --all)
+    Uninstall(UninstallArgs),
     /// Start an installed service
     Start(ServiceArgs),
     /// Stop an installed service
     Stop(ServiceArgs),
     /// Restart an installed service (stop, then start)
     Restart(ServiceArgs),
+
+    /// Entry point used by the Windows service manager. Not for interactive use
+    #[clap(hide = true)]
+    Run {
+        /// The configuration file the service runs with
+        #[clap(long, parse(from_os_str))]
+        config: PathBuf,
+    },
 }
 
 #[derive(Args, Debug, Clone, Default)]

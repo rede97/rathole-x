@@ -102,7 +102,7 @@ cargo check --target x86_64-unknown-linux-gnu --no-default-features --features e
 
 ## Service Lifecycle Facts
 
-- Multi-service model: `install <server|client> --yes --name N` → SCM `rathole-x-<role>-<N>`, config `<config_dir>/<N>.toml`, shared binary + per-service `uninstall-<N>.bat`. Single-role configs only: `config` ops enforce the role (server config rejects client entries).
+- Multi-service model: `service install <server|client> --yes --name N` → SCM `rathole-x-<role>-<N>`, config `<config_dir>/<N>.toml`, shared binary + per-service `uninstall-<N>.bat`. Single-role configs only: `config` ops enforce the role (server config rejects client entries).
 - `service start|stop|restart [--name|--all]`, `upgrade --yes` (stop all → replace shared binary → start all), `uninstall --yes --all` (removes everything). Uninstalling an already-removed service cleans leftovers WITHOUT UAC; normal uninstall leaves the kept config user-deletable (icacls :M).
 - The SCM `launch_arguments` MUST be `["service-run", "--config", <path>]` — missing `--config` makes the service exit at startup (SCM error 1053); guarded by a unit test.
 - `run_with_config` hibernates when the config is missing/invalid at startup (2s retry + "Degraded: waiting for a config update"), recovers on the next valid config — the service never dies from a bad config.

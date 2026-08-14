@@ -469,8 +469,8 @@ pub fn check_version_compat(path: &Path) -> Result<()> {
         if stamped != crate::cli::major_version() {
             bail!(
                 "This config is managed by rathole-x v{} but this CLI is v{}. \
-                 Reinstall the service to upgrade: `rathole-x uninstall --yes` then \
-                 `rathole-x install <server|client> --yes`.",
+                 Reinstall the service to upgrade: `rathole-x service uninstall --yes` then \
+                 `rathole-x service install <server|client> --yes`.",
                 stamped,
                 crate::cli::major_version()
             );

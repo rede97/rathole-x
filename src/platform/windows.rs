@@ -232,7 +232,8 @@ pub fn relaunch_elevated_wait(args: &[String]) -> Result<String> {
 /// startup and the SCM reports error 1053.
 fn launch_arguments(config_path: &Path) -> Vec<OsString> {
     vec![
-        OsString::from("service-run"),
+        OsString::from("service"),
+        OsString::from("run"),
         OsString::from("--config"),
         config_path.as_os_str().to_os_string(),
     ]
@@ -337,7 +338,7 @@ pub fn install(opts: &ServiceInstallOptions) -> Result<()> {
                 if io_err.raw_os_error() == Some(ERROR_SERVICE_EXISTS as i32) =>
             {
                 anyhow!(
-                    "service '{}' already exists; run `rathole-x uninstall --yes --name {}` first",
+                    "service '{}' already exists; run `rathole-x service uninstall --yes --name {}` first",
                     service_name, opts.name
                 )
             }
@@ -367,7 +368,7 @@ fn ensure_binary_copy(source: &Path, dest: &Path) -> Result<()> {
     }
     std::fs::copy(source, dest).with_context(|| {
         format!(
-            "failed to copy {} to {} (is the service running from {}? run `rathole-x uninstall --yes` first)",
+            "failed to copy {} to {} (is the service running from {}? run `rathole-x service uninstall --yes` first)",
             source.display(),
             dest.display(),
             dest.display()
@@ -401,11 +402,11 @@ fn write_uninstall_bat(
         "@echo off\r\n\
          setlocal\r\n\
          echo Uninstalling {service} ...\r\n\
-         \"%~dp0{exe}\" uninstall --yes --name \"{name}\" --config \"%~dp0{config}\"\r\n\
+         \"%~dp0{exe}\" service uninstall --yes --name \"{name}\" --config \"%~dp0{config}\"\r\n\
          if errorlevel 1 goto :failed\r\n\
          echo.\r\n\
          echo Done. To also delete the configuration, run:\r\n\
-         echo   \"%~dp0{exe}\" uninstall --yes --purge --name \"{name}\" --config \"%~dp0{config}\"\r\n\
+         echo   \"%~dp0{exe}\" service uninstall --yes --purge --name \"{name}\" --config \"%~dp0{config}\"\r\n\
          del \"%~f0\"\r\n\
          goto :eof\r\n\
          :failed\r\n\
@@ -958,6 +959,8 @@ pub fn control_service(cmd: crate::cli::ServiceCmd) -> Result<()> {
         Start(a) => ("start", a),
         Stop(a) => ("stop", a),
         Restart(a) => ("restart", a),
+        // Install/Uninstall/Run are handled by the dispatch layer.
+        _ => unreachable!("only start/stop/restart reach control_service"),
     };
 
     let targets: Vec<(String, crate::config_edit::ServiceRole)> = if args.all {
@@ -1214,10 +1217,11 @@ mod tests {
         // The --config flag is load-bearing: missing it makes the service
         // exit at startup and the SCM reports error 1053.
         let args = launch_arguments(Path::new(r"C:\dir\svc.toml"));
-        assert_eq!(args.len(), 3);
-        assert_eq!(args[0].to_str(), Some("service-run"));
-        assert_eq!(args[1].to_str(), Some("--config"));
-        assert_eq!(args[2].to_str(), Some(r"C:\dir\svc.toml"));
+        assert_eq!(args.len(), 4);
+        assert_eq!(args[0].to_str(), Some("service"));
+        assert_eq!(args[1].to_str(), Some("run"));
+        assert_eq!(args[2].to_str(), Some("--config"));
+        assert_eq!(args[3].to_str(), Some(r"C:\dir\svc.toml"));
     }
 
     #[test]
@@ -1242,7 +1246,7 @@ mod tests {
         write_uninstall_bat(&exe, &config, "relay", crate::config_edit::ServiceRole::Server);
 
         let bat = std::fs::read_to_string(dir.join("uninstall-relay.bat")).unwrap();
-        assert!(bat.contains("uninstall --yes --name \"relay\""));
+        assert!(bat.contains("service uninstall --yes --name \"relay\""));
         assert!(bat.contains("--config \"%~dp0cfg.toml\""));
         assert!(bat.contains("--purge"), "purge hint documented in the bat");
         assert!(bat.contains("rathole-x.exe"));

@@ -21,7 +21,7 @@ sudo rathole-x uninstall [--name rathole-x]
   - 当前用户对配置可写（ACL 授权）：CLI 免提权直接原子写配置（临时文件 + rename），服务经 watcher 热加载。
   - 不可写（默认）：CLI 须提权（Windows 走 UAC `relaunch_elevated_wait`；Linux 对应 sudo）后覆盖配置，服务热加载。
   - CLI 侧判定逻辑在 `config_edit::writable_by_current_user`（打开探测/目录探测）+ `platform` 提权流程。
-- 版本契约：多服务模型：`install server|client --name <N>` 每服务一个配置文件（`/etc/rathole-x/<N>.toml`），SCM 名 `rathole-x-<role>-<N>`；`version.toml` 由 install 写入 `version = <大版本>`；`config add/set/remove` 在大版本不匹配时拒绝执行（`config_edit::check_version_compat`），修复方式是重装服务；只读命令与 install/uninstall 不受限。**开发规则：任何破坏性配置 schema 变更（改/删字段、改语义或默认值）必须升大版本**；纯新增可选字段（带 serde default）不要求。版本戳放 version.toml 而非主配置，保证主配置文件仍可被上游 rathole 解析。
+- 版本契约：多服务模型：`service install server|client --name <N>` 每服务一个配置文件（`/etc/rathole-x/<N>.toml`），SCM 名 `rathole-x-<role>-<N>`；`version.toml` 由 install 写入 `version = <大版本>`；`config add/set/remove` 在大版本不匹配时拒绝执行（`config_edit::check_version_compat`），修复方式是重装服务；只读命令与 install/uninstall 不受限。**开发规则：任何破坏性配置 schema 变更（改/删字段、改语义或默认值）必须升大版本**；纯新增可选字段（带 serde default）不要求。版本戳放 version.toml 而非主配置，保证主配置文件仍可被上游 rathole 解析。
 - 已实现的原则沿用：daemon 单进程可同时承载 [server] 与 [client] 双模式(lib.rs `RunMode::Both`)。
 
 ## 文件布局

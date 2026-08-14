@@ -113,44 +113,7 @@ async fn dispatch_command(cmd: Commands, shutdown_rx: broadcast::Receiver<bool>)
         Config { cmd } => dispatch_config_command(cmd).await,
         Status(s) => status::run_status(&s),
 
-        Install(i) => {
-            if !i.yes {
-                return print_subcommand_usage::<cli::InstallArgs>("install");
-            }
-            let role = match i.role {
-                Some(r) => config_edit::ServiceRole::from_cli(r),
-                None => bail!("A role is required: `install server` or `install client`"),
-            };
-            let (name, config_path) = config_edit::service_config_path(i.name.as_deref())?;
-            let created = config_edit::ensure_role_config(&config_path, role)?;
-            if created {
-                println!(
-                    "Created {} config at {} (no services configured yet).",
-                    role.key(),
-                    config_path.display()
-                );
-            }
-            platform::install_service(&i, role, &name, &config_path)?;
-
-            Ok(())
-        }
-        Uninstall(u) => {
-            if !u.yes {
-                return print_subcommand_usage::<cli::UninstallArgs>("uninstall");
-            }
-            if u.all {
-                platform::uninstall_all(&u)?;
-                return Ok(());
-            }
-            let config_path = config_edit::resolve_service_config(
-                u.config.as_ref(),
-                u.name.as_deref(),
-            )?;
-            platform::uninstall_service(&u, &config_path)?;
-
-            Ok(())
-        }
-        Service { cmd } => Ok(platform::control_service(cmd)?),
+        Service { cmd } => Ok(dispatch_service_command(cmd)?),
         Upgrade(u) => {
             if !u.yes {
                 return print_subcommand_usage::<cli::UpgradeArgs>("upgrade");
@@ -158,7 +121,6 @@ async fn dispatch_command(cmd: Commands, shutdown_rx: broadcast::Receiver<bool>)
             platform::upgrade_binary()?;
             Ok(())
         }
-        ServiceRun { config } => platform::run_service(config),
     }
 }
 
@@ -196,6 +158,49 @@ async fn dispatch_config_command(cmd: cli::ConfigCmd) -> Result<()> {
             }
             config_edit::run_set(&s, &path)
         }
+    }
+}
+
+/// Dispatches `rathole-x service <action>`: install, uninstall, control
+/// and the hidden SCM run entry.
+fn dispatch_service_command(cmd: cli::ServiceCmd) -> Result<()> {
+    use cli::ServiceCmd::*;
+    match cmd {
+        Install(i) => {
+            if !i.yes {
+                return print_subcommand_usage::<cli::InstallArgs>("install");
+            }
+            let role = match i.role {
+                Some(r) => config_edit::ServiceRole::from_cli(r),
+                None => bail!("A role is required: `service install server` or `service install client`"),
+            };
+            let (name, config_path) = config_edit::service_config_path(i.name.as_deref())?;
+            let created = config_edit::ensure_role_config(&config_path, role)?;
+            if created {
+                println!(
+                    "Created {} config at {} (no services configured yet).",
+                    role.key(),
+                    config_path.display()
+                );
+            }
+            platform::install_service(&i, role, &name, &config_path)?;
+            Ok(())
+        }
+        Uninstall(u) => {
+            if !u.yes {
+                return print_subcommand_usage::<cli::UninstallArgs>("uninstall");
+            }
+            if u.all {
+                platform::uninstall_all(&u)?;
+                return Ok(());
+            }
+            let config_path =
+                config_edit::resolve_service_config(u.config.as_ref(), u.name.as_deref())?;
+            platform::uninstall_service(&u, &config_path)?;
+            Ok(())
+        }
+        Run { config } => platform::run_service(config),
+        other => Ok(platform::control_service(other)?),
     }
 }
 
