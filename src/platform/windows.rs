@@ -340,13 +340,24 @@ fn lockdown_icacls_args(
     let admins_full = OsString::from("*S-1-5-32-544:F");
     let mut cmds: Vec<Vec<OsString>> = Vec::new();
 
-    let system_full = OsString::from("*S-1-5-18:F");
     let system_read = OsString::from("*S-1-5-18:R");
     let users_create = OsString::from("*S-1-5-32-545:WD");
     let users_modify = OsString::from("*S-1-5-32-545:M");
 
-    let mut dir_grants: Vec<&OsStr> = vec![&admins_full, &system_full];
+    // Directory grants MUST carry (OI)(CI): rewriting the directory DACL
+    // (SetNamedSecurityInfo) auto-propagates to the children, and the
+    // binary/config are created BEFORE the lockdown with purely inherited
+    // ACEs. Non-inheritable directory grants propagate as "remove every
+    // inherited ACE" — the children end up with an EMPTY DACL (not even
+    // an elevated process can open them; observed on a real machine).
+    // Inheritable grants propagate into valid child ACEs instead, and each
+    // child is then locked individually below.
+    let admins_dir_full = OsString::from("*S-1-5-32-544:(OI)(CI)F");
+    let system_dir_full = OsString::from("*S-1-5-18:(OI)(CI)F");
+    let mut dir_grants: Vec<&OsStr> = vec![&admins_dir_full, &system_dir_full];
     if allow_user_config {
+        // Directory-local only: Users may create files here; the files
+        // themselves are owned (and thus writable) by their creator.
         dir_grants.push(&users_create);
     }
     cmds.extend(path_lockdown_args(dir, &dir_grants));
@@ -1861,7 +1872,7 @@ mod tests {
         assert_eq!(cmds[1][0].as_os_str(), dir.as_os_str());
         assert_eq!(
             cmd_string(&cmds[1]),
-            "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:F"
+            "/inheritance:r /grant *S-1-5-32-544:(OI)(CI)F /grant *S-1-5-18:(OI)(CI)F"
         );
         assert_eq!(cmds[2][0].as_os_str(), exe.as_os_str());
         assert_eq!(cmd_string(&cmds[2]), "/setowner *S-1-5-32-544");
@@ -1895,10 +1906,12 @@ mod tests {
         let cmds = lockdown_icacls_args(dir, exe, config, true);
 
         assert_eq!(cmds.len(), 6);
-        // Directory: Users may create files (atomic write + rename)...
+        // Directory: grants are inheritable so the DACL rewrite propagates
+        // as valid child ACEs instead of stripping the children to an
+        // empty DACL; Users may create files (atomic write + rename)...
         assert_eq!(
             cmd_string(&cmds[1]),
-            "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:F /grant *S-1-5-32-545:WD"
+            "/inheritance:r /grant *S-1-5-32-544:(OI)(CI)F /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-545:WD"
         );
         // ...the binary is never user-writable (LocalSystem escalation)...
         assert_eq!(
