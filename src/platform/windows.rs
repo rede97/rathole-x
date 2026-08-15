@@ -286,16 +286,20 @@ pub fn relaunch_elevated_wait(args: &[OsString]) -> Result<String> {
         code
     };
 
-    let output = std::fs::read_to_string(&log_path).unwrap_or_default();
-    let _ = std::fs::remove_file(&log_path);
-
+    let output = std::fs::read_to_string(&log_path).unwrap_or_else(|e| {
+        format!("<(elevation log {} unreadable: {})", log_path.display(), e)
+    });
     if exit_code != 0 {
+        // Keep the log file for diagnosis: it holds everything the hidden
+        // child printed before failing.
         bail!(
-            "elevated command failed (exit code {}):\n{}",
+            "elevated command failed (exit code {}); full output kept at {}:\n{}",
             exit_code,
+            log_path.display(),
             output.trim()
         );
     }
+    let _ = std::fs::remove_file(&log_path);
     Ok(output)
 }
 
@@ -318,10 +322,10 @@ fn launch_arguments(config_path: &Path) -> Vec<OsString> {
 ///
 /// Layout: one `/setowner` per path (a user-precreated directory/exe/config
 /// keeps its creator as owner, and an NTFS owner implicitly holds WRITE_DAC —
-/// enough to silently undo every grant below), then one `/reset` (drops any
-/// pre-existing explicit ACEs), then `/inheritance:r` plus explicit grants.
-/// SIDs are locale-independent: S-1-5-32-544 = Administrators,
-/// S-1-5-18 = SYSTEM, S-1-5-32-545 = Users.
+/// enough to silently undo every grant below), then one atomic
+/// `/inheritance:r` + explicit grants per path (see `path_lockdown_args` for
+/// why there is no `/reset`). SIDs are locale-independent:
+/// S-1-5-32-544 = Administrators, S-1-5-18 = SYSTEM, S-1-5-32-545 = Users.
 ///
 /// The config defaults to Administrators full control (elevated edits) and
 /// SYSTEM read (the service only reads it). With `allow_user_config` the
@@ -358,17 +362,25 @@ fn lockdown_icacls_args(
     cmds
 }
 
-/// The three icacls invocations that lock one path down: take ownership
+/// The two icacls invocations that lock one path down: take ownership
 /// (the pre-creation owner implicitly holds WRITE_DAC and could otherwise
-/// silently undo the grants), drop every existing ACE, then grant exactly
-/// `grants`.
+/// silently undo the grants), then — in ONE atomic command — strip the
+/// inherited ACEs and grant exactly `grants`.
+///
+/// Deliberately no `/reset`: resetting the DACL to "inherit from the
+/// parent" while the parent directory is already locked (its grants carry
+/// no OI/CI flags, nothing is inheritable) leaves an EMPTY DACL as an
+/// intermediate state — an empty DACL denies everyone but the owner's
+/// implicit READ_CONTROL/WRITE_DAC, so not even an elevated process can
+/// read the file. If the grant command then fails, that state is permanent.
+/// A single `/inheritance:r + grants` invocation is applied atomically, so
+/// a failure leaves the previous (readable) DACL untouched.
 fn path_lockdown_args(path: &Path, grants: &[&OsStr]) -> Vec<Vec<OsString>> {
     let mut cmds = vec![vec![
         path.as_os_str().to_os_string(),
         OsString::from("/setowner"),
         OsString::from("*S-1-5-32-544"),
     ]];
-    cmds.push(vec![path.as_os_str().to_os_string(), OsString::from("/reset")]);
     let mut cmd = vec![
         path.as_os_str().to_os_string(),
         OsString::from("/inheritance:r"),
@@ -1777,7 +1789,6 @@ mod tests {
         // owner to Administrators needs an elevated token; the preserved
         // DACL is what makes this test's comparison meaningful.)
         for args in [
-            vec!["/reset"],
             vec![
                 "/inheritance:r",
                 "/grant",
@@ -1840,34 +1851,30 @@ mod tests {
         let config = Path::new(r"C:\cfg\config.toml");
         let cmds = lockdown_icacls_args(dir, exe, config, false);
 
-        // Three invocations per path: /setowner, /reset, then
-        // /inheritance:r + grants.
-        assert_eq!(cmds.len(), 9);
+        // Two invocations per path: /setowner, then one ATOMIC
+        // /inheritance:r + grants (no /reset — see path_lockdown_args).
+        assert_eq!(cmds.len(), 6);
         // Ownership is taken first so the pre-creation owner cannot
         // rewrite the new DACL.
         assert_eq!(cmds[0][0].as_os_str(), dir.as_os_str());
         assert_eq!(cmd_string(&cmds[0]), "/setowner *S-1-5-32-544");
         assert_eq!(cmds[1][0].as_os_str(), dir.as_os_str());
-        assert_eq!(cmd_string(&cmds[1]), "/reset");
         assert_eq!(
-            cmd_string(&cmds[2]),
+            cmd_string(&cmds[1]),
             "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:F"
         );
+        assert_eq!(cmds[2][0].as_os_str(), exe.as_os_str());
+        assert_eq!(cmd_string(&cmds[2]), "/setowner *S-1-5-32-544");
         assert_eq!(cmds[3][0].as_os_str(), exe.as_os_str());
-        assert_eq!(cmd_string(&cmds[3]), "/setowner *S-1-5-32-544");
-        assert_eq!(cmds[4][0].as_os_str(), exe.as_os_str());
-        assert_eq!(cmd_string(&cmds[4]), "/reset");
         assert_eq!(
-            cmd_string(&cmds[5]),
+            cmd_string(&cmds[3]),
             "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:F"
         );
-        assert_eq!(cmds[6][0].as_os_str(), config.as_os_str());
-        assert_eq!(cmd_string(&cmds[6]), "/setowner *S-1-5-32-544");
-        assert_eq!(cmds[7][0].as_os_str(), config.as_os_str());
-        assert_eq!(cmd_string(&cmds[7]), "/reset");
+        assert_eq!(cmds[4][0].as_os_str(), config.as_os_str());
+        assert_eq!(cmd_string(&cmds[4]), "/setowner *S-1-5-32-544");
         // Config: SYSTEM only needs read; no Users access by default.
         assert_eq!(
-            cmd_string(&cmds[8]),
+            cmd_string(&cmds[5]),
             "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:R"
         );
         for cmd in &cmds {
@@ -1887,20 +1894,20 @@ mod tests {
         let config = Path::new(r"C:\cfg\config.toml");
         let cmds = lockdown_icacls_args(dir, exe, config, true);
 
-        assert_eq!(cmds.len(), 9);
+        assert_eq!(cmds.len(), 6);
         // Directory: Users may create files (atomic write + rename)...
         assert_eq!(
-            cmd_string(&cmds[2]),
+            cmd_string(&cmds[1]),
             "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:F /grant *S-1-5-32-545:WD"
         );
         // ...the binary is never user-writable (LocalSystem escalation)...
         assert_eq!(
-            cmd_string(&cmds[5]),
+            cmd_string(&cmds[3]),
             "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:F"
         );
         // ...and the config gets Users modify (write), never world-read.
         assert_eq!(
-            cmd_string(&cmds[8]),
+            cmd_string(&cmds[5]),
             "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:R /grant *S-1-5-32-545:M"
         );
     }
