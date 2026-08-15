@@ -152,15 +152,20 @@ fn quote_arg(arg: &str) -> String {
     out
 }
 
-/// Remove any `--elevated-log <path>` pair from `args` so a relay never
-/// forwards a stale log path from the original argv before appending its own.
-fn strip_elevated_log(args: &[OsString]) -> Vec<OsString> {
+/// Remove any `--elevated-log <path>` pair and any `--confirmed` flag from
+/// `args` so a relay never forwards stale relay flags from the original argv
+/// before appending its own.
+fn strip_relay_flags(args: &[OsString]) -> Vec<OsString> {
     let mut out = Vec::with_capacity(args.len());
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
         if a.as_os_str() == OsStr::new("--elevated-log") {
             // Drop the flag and its value.
             let _ = iter.next();
+            continue;
+        }
+        if a.as_os_str() == OsStr::new("--confirmed") {
+            // Boolean flag, no value to drop.
             continue;
         }
         out.push(a.clone());
@@ -215,9 +220,13 @@ pub fn relaunch_elevated_wait(args: &[OsString]) -> Result<String> {
 
     let log_path = pick_elevated_log_path()?;
 
-    let mut params: Vec<OsString> = strip_elevated_log(args);
+    let mut params: Vec<OsString> = strip_relay_flags(args);
     params.push(OsString::from("--elevated-log"));
     params.push(log_path.as_os_str().to_os_string());
+    // The parent already confirmed interactively; the hidden TTY-less child
+    // must not fall back to printing the usage (environment inheritance is
+    // not guaranteed across the UAC boundary).
+    params.push(OsString::from("--confirmed"));
     let params = params
         .iter()
         .map(|a| quote_arg(&a.to_string_lossy()))
@@ -1693,12 +1702,19 @@ mod tests {
     }
 
     #[test]
-    fn strip_elevated_log_removes_flag_and_value() {
-        let args: Vec<OsString> = ["service", "uninstall", "--elevated-log", r"C:\t\old.log", "--yes"]
-            .iter()
-            .map(OsString::from)
-            .collect();
-        let stripped = strip_elevated_log(&args);
+    fn strip_relay_flags_removes_stale_values() {
+        let args: Vec<OsString> = [
+            "service",
+            "uninstall",
+            "--elevated-log",
+            r"C:\t\old.log",
+            "--confirmed",
+            "--yes",
+        ]
+        .iter()
+        .map(OsString::from)
+        .collect();
+        let stripped = strip_relay_flags(&args);
         let plain: Vec<String> = stripped
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1707,11 +1723,11 @@ mod tests {
 
         // A trailing flag without a value is dropped too.
         let args: Vec<OsString> = ["status", "--elevated-log"].iter().map(OsString::from).collect();
-        assert_eq!(strip_elevated_log(&args).len(), 1);
+        assert_eq!(strip_relay_flags(&args).len(), 1);
 
-        // No flag: unchanged.
+        // No relay flag: unchanged.
         let args: Vec<OsString> = ["status", "--json"].iter().map(OsString::from).collect();
-        assert_eq!(strip_elevated_log(&args).len(), 2);
+        assert_eq!(strip_relay_flags(&args).len(), 2);
     }
 
     /// Concatenate one icacls invocation's arguments (after the target

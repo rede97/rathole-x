@@ -54,6 +54,12 @@ pub struct Cli {
     /// Redirect all output to this file (used by the UAC elevation relay)
     #[clap(long, hide = true, global = true)]
     pub elevated_log: Option<PathBuf>,
+
+    /// Mark this process as already confirmed (used by the UAC elevation
+    /// relay: the parent confirms interactively, the hidden TTY-less child
+    /// re-runs the same command line and must not ask again)
+    #[clap(long, hide = true, global = true)]
+    pub confirmed: bool,
 }
 
 #[derive(Subcommand, Debug, Clone)]

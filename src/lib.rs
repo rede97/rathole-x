@@ -312,8 +312,10 @@ fn print_subcommand_usage<T: clap::Args>(name: &str) -> Result<()> {
 /// Environment variable set after a successful interactive confirmation.
 /// The UAC elevation relay re-runs the same command line in a child process
 /// that has no TTY; the inherited variable marks that child as confirmed so
-/// it does not fall back to printing usage.
-const CONFIRMED_ENV: &str = "RATHOLE_X_CONFIRMED";
+/// it does not fall back to printing usage. The relay forwards it explicitly
+/// via the hidden `--confirmed` flag (`main.rs`) because environment
+/// inheritance across the UAC boundary is not guaranteed.
+pub const CONFIRMED_ENV: &str = "RATHOLE_X_CONFIRMED";
 
 /// Gate a privileged subcommand behind user confirmation.
 ///

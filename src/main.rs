@@ -12,6 +12,13 @@ async fn main() -> Result<()> {
     if let Some(path) = &args.elevated_log {
         rathole::platform::redirect_stdio_to_file(path);
     }
+    if args.confirmed {
+        // The elevation relay re-runs the command line in a hidden child
+        // with no TTY; the parent's interactive confirmation carries over
+        // through this flag (environment inheritance is not guaranteed
+        // across the UAC boundary).
+        std::env::set_var(rathole::CONFIRMED_ENV, "1");
+    }
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
     tokio::spawn(async move {
         if let Err(e) = signal::ctrl_c().await {
