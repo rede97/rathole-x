@@ -1052,6 +1052,17 @@ fn service_main_inner(config_path: PathBuf) -> Result<()> {
     run_result
 }
 
+/// Relay helper for the un-elevated CLI flows: elevate, wait for the
+/// child, then REPLAY its output verbatim. The elevated child prints every
+/// user-visible line (including the final success or failure message), so
+/// the parent must not invent its own summary on top — a failed child
+/// surfaces through the returned error, never as a success line.
+fn elevate_and_replay() -> Result<()> {
+    let output = relaunch_elevated_wait(&std::env::args_os().skip(1).collect::<Vec<_>>())?;
+    print!("{}", output);
+    Ok(())
+}
+
 /// CLI flow for `rathole-x service install`: print the plan in the caller's window,
 /// elevate if needed (the elevated phase runs hidden), and run the SCM
 /// registration. Every user-visible line is printed from this process.
@@ -1074,12 +1085,7 @@ pub fn install_service(
 
     if !is_elevated() {
         println!("Requesting administrator rights (UAC)...");
-        let _ = relaunch_elevated_wait(&std::env::args_os().skip(1).collect::<Vec<_>>())?;
-        println!("Service '{}' installed and started", service_name);
-        println!(
-            "Run `rathole-x status --name {}` to inspect, `rathole-x config add --name {} ...` to configure (hot-reloaded).",
-            name, name
-        );
+        elevate_and_replay()?;
         return Ok(());
     }
 
@@ -1153,13 +1159,7 @@ pub fn uninstall_service(args: &UninstallArgs, config_path: &Path) -> Result<()>
 
     if !is_elevated() {
         println!("Requesting administrator rights (UAC)...");
-        let _ = relaunch_elevated_wait(&std::env::args_os().skip(1).collect::<Vec<_>>())?;
-        println!("Service '{}' stopped and removed", name);
-        if args.purge {
-            println!("  Config:      removed ({})", config_path.display());
-        } else {
-            println!("  Config:      kept (user-deletable) ({})", config_path.display());
-        }
+        elevate_and_replay()?;
         return Ok(());
     }
 
@@ -1191,8 +1191,7 @@ pub fn uninstall_all(_args: &UninstallArgs) -> Result<()> {
 
     if !is_elevated() {
         println!("Requesting administrator rights (UAC) to remove all services...");
-        let _ = relaunch_elevated_wait(&std::env::args_os().skip(1).collect::<Vec<_>>())?;
-        println!("All rathole-x services removed.");
+        elevate_and_replay()?;
         return Ok(());
     }
 
@@ -1279,8 +1278,7 @@ pub fn control_service(cmd: crate::cli::ServiceCmd) -> Result<()> {
 
     if !is_elevated() {
         println!("Requesting administrator rights (UAC)...");
-        let _ = relaunch_elevated_wait(&std::env::args_os().skip(1).collect::<Vec<_>>())?;
-        println!("Done: {} {}", action, names);
+        elevate_and_replay()?;
         return Ok(());
     }
 
@@ -1319,8 +1317,7 @@ pub fn control_service(cmd: crate::cli::ServiceCmd) -> Result<()> {
 pub fn upgrade_binary() -> Result<()> {
     if !is_elevated() {
         println!("Requesting administrator rights (UAC) to update the installed binary...");
-        let _ = relaunch_elevated_wait(&std::env::args_os().skip(1).collect::<Vec<_>>())?;
-        println!("Binary updated and services restarted.");
+        elevate_and_replay()?;
         return Ok(());
     }
 
