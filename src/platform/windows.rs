@@ -12,13 +12,21 @@
 
 use crate::cli::{InstallArgs, UninstallArgs};
 use std::ffi::{OsStr, OsString};
+use std::io::{Read, Write};
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::RawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use crate::runtime_status::{
+    endpoint_for_config, snapshot, RuntimeRegistry, RuntimeSnapshot, MAX_STATUS_RESPONSE,
+    STATUS_REQUEST,
+};
 use anyhow::{anyhow, bail, Context, Result};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::windows::named_pipe::NamedPipeServer;
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 use windows_service::service::{
@@ -29,18 +37,38 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_service::{define_windows_service, service_dispatcher, Error as ServiceError};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_CANCELLED, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_EXISTS,
+    CloseHandle, LocalFree, ERROR_CANCELLED, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_EXISTS,
     ERROR_SERVICE_MARKED_FOR_DELETE, HANDLE,
 };
+use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::{
-    GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    GetTokenInformation, TokenElevation, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_QUERY,
 };
 
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
+};
+use windows_sys::Win32::System::Pipes::{
+    CreateNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
+    PIPE_WAIT,
+};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, WaitForSingleObject, INFINITE,
 };
 use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+// Platform actions report progress through this module. In JSON mode stdout
+// belongs exclusively to the top-level envelope, including across UAC relay.
+macro_rules! println {
+    ($($arg:tt)*) => {{
+        if crate::is_json_mode() {
+            eprintln!($($arg)*);
+        } else {
+            ::std::println!($($arg)*);
+        }
+    }};
+}
 
 /// Default service name, also used as the name registered with the SCM
 /// dispatcher. For `SERVICE_WIN32_OWN_PROCESS` services the name passed to
@@ -200,9 +228,7 @@ fn pick_elevated_log_path() -> Result<PathBuf> {
                 return Ok(candidate);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => {
-                return Err(anyhow!(e)).context("failed to create the elevation log file")
-            }
+            Err(e) => return Err(anyhow!(e)).context("failed to create the elevation log file"),
         }
     }
     bail!("failed to pick a free elevation log path after 8 attempts");
@@ -286,9 +312,8 @@ pub fn relaunch_elevated_wait(args: &[OsString]) -> Result<String> {
         code
     };
 
-    let output = std::fs::read_to_string(&log_path).unwrap_or_else(|e| {
-        format!("<(elevation log {} unreadable: {})", log_path.display(), e)
-    });
+    let output = std::fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| format!("<(elevation log {} unreadable: {})", log_path.display(), e));
     if exit_code != 0 {
         // Keep the log file for diagnosis: it holds everything the hidden
         // child printed before failing.
@@ -430,11 +455,16 @@ fn exe_lockdown_args(exe: &Path) -> Vec<Vec<OsString>> {
 /// returned.
 pub fn replace_file_preserving_security(replacement: &Path, replaced: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{GetLastError, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
+    use windows_sys::Win32::Foundation::{
+        GetLastError, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
+    };
     use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
 
     fn wide(p: &Path) -> Vec<u16> {
-        p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
     }
     let replaced_w = wide(replaced);
     let replacement_w = wide(replacement);
@@ -509,9 +539,8 @@ pub fn install(opts: &ServiceInstallOptions) -> Result<()> {
         .unwrap_or(Path::new("."))
         .to_path_buf();
     if !dir.exists() {
-        std::fs::create_dir_all(&dir).with_context(|| {
-            format!("failed to create config directory {}", dir.display())
-        })?;
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create config directory {}", dir.display()))?;
     }
 
     // Write the version stamp. It deliberately has no CLI editor: changing it
@@ -732,48 +761,47 @@ pub fn uninstall(config_path: &Path, purge: bool) -> Result<()> {
         )
     };
 
-    let service = match &role {
-        Some(role) => {
-            let primary = scm_name(*role, &name);
-            match open(&primary) {
-                Ok(s) => s,
-                Err(_) => {
-                    let alt_role = match role {
-                        crate::config_edit::ServiceRole::Client => {
-                            crate::config_edit::ServiceRole::Server
-                        }
-                        crate::config_edit::ServiceRole::Server => {
-                            crate::config_edit::ServiceRole::Client
-                        }
-                    };
-                    open(&scm_name(alt_role, &name)).map_err(|e| match e {
-                        ServiceError::Winapi(io_err)
-                            if io_err.raw_os_error()
-                                == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
-                        {
-                            anyhow!("service '{}' does not exist", primary)
-                        }
-                        other => anyhow!(other)
-                            .context(format!("failed to open service '{}'", primary)),
-                    })?
+    let service =
+        match &role {
+            Some(role) => {
+                let primary = scm_name(*role, &name);
+                match open(&primary) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        let alt_role = match role {
+                            crate::config_edit::ServiceRole::Client => {
+                                crate::config_edit::ServiceRole::Server
+                            }
+                            crate::config_edit::ServiceRole::Server => {
+                                crate::config_edit::ServiceRole::Client
+                            }
+                        };
+                        open(&scm_name(alt_role, &name)).map_err(|e| match e {
+                            ServiceError::Winapi(io_err)
+                                if io_err.raw_os_error()
+                                    == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
+                            {
+                                anyhow!("service '{}' does not exist", primary)
+                            }
+                            other => anyhow!(other)
+                                .context(format!("failed to open service '{}'", primary)),
+                        })?
+                    }
                 }
             }
-        }
-        None => {
-            // Config unreadable: try both role variants.
-            let a = scm_name(crate::config_edit::ServiceRole::Client, &name);
-            let b = scm_name(crate::config_edit::ServiceRole::Server, &name);
-            match open(&a).or_else(|_| open(&b)) {
-                Ok(s) => s,
-                Err(e) => {
-                    return Err(anyhow!(e).context(format!(
-                        "failed to open service '{}' or '{}'",
-                        a, b
-                    )))
+            None => {
+                // Config unreadable: try both role variants.
+                let a = scm_name(crate::config_edit::ServiceRole::Client, &name);
+                let b = scm_name(crate::config_edit::ServiceRole::Server, &name);
+                match open(&a).or_else(|_| open(&b)) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return Err(anyhow!(e)
+                            .context(format!("failed to open service '{}' or '{}'", a, b)))
+                    }
                 }
             }
-        }
-    };
+        };
 
     let status = service
         .query_status()
@@ -812,9 +840,7 @@ pub fn uninstall(config_path: &Path, purge: bool) -> Result<()> {
         Ok(()) => {}
         Err(ServiceError::Winapi(io_err))
             if io_err.raw_os_error() == Some(ERROR_SERVICE_MARKED_FOR_DELETE as i32) => {}
-        Err(e) => {
-            return Err(anyhow!(e)).context("failed to delete service")
-        }
+        Err(e) => return Err(anyhow!(e)).context("failed to delete service"),
     }
 
     remove_service_files(config_path, purge);
@@ -1000,7 +1026,10 @@ fn service_main_inner(config_path: PathBuf) -> Result<()> {
         .with_ansi(false)
         .try_init();
 
-    info!("rathole-x service starting; config: {}", config_path.display());
+    info!(
+        "rathole-x service starting; config: {}",
+        config_path.display()
+    );
 
     report_status(
         &status_handle,
@@ -1089,10 +1118,28 @@ fn service_main_inner(config_path: PathBuf) -> Result<()> {
 /// user-visible line (including the final success or failure message), so
 /// the parent must not invent its own summary on top — a failed child
 /// surfaces through the returned error, never as a success line.
+fn replay_elevated_output(output: &str) -> Result<()> {
+    if !crate::is_json_mode() {
+        print!("{}", output);
+        return Ok(());
+    }
+    let mut envelope = None;
+    for line in output.lines() {
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(value) if value.get("ok").is_some() => envelope = Some(line),
+            _ => eprintln!("{}", line),
+        }
+    }
+    let envelope = envelope
+        .ok_or_else(|| anyhow!("elevated command completed without a JSON result envelope"))?;
+    std::env::set_var("RATHOLE_X_JSON_RELAYED", "1");
+    ::std::println!("{}", envelope);
+    Ok(())
+}
+
 fn elevate_and_replay() -> Result<()> {
     let output = relaunch_elevated_wait(&std::env::args_os().skip(1).collect::<Vec<_>>())?;
-    print!("{}", output);
-    Ok(())
+    replay_elevated_output(&output)
 }
 
 /// CLI flow for `rathole-x service install`: print the plan in the caller's window,
@@ -1174,7 +1221,10 @@ pub fn uninstall_service(args: &UninstallArgs, config_path: &Path) -> Result<()>
 
     if !exists {
         // Service already gone: clean the files directly, no UAC needed.
-        println!("Service '{}' is not installed; removing leftover files without elevation.", name);
+        println!(
+            "Service '{}' is not installed; removing leftover files without elevation.",
+            name
+        );
         remove_service_files(config_path, args.purge);
         // Best effort, matching the elevated path: a kept config should stay
         // readable/deletable by the user (fails silently without rights).
@@ -1207,7 +1257,10 @@ pub fn uninstall_service(args: &UninstallArgs, config_path: &Path) -> Result<()>
     if args.purge {
         println!("  Config:      removed ({})", config_path.display());
     } else {
-        println!("  Config:      kept (user-deletable) ({})", config_path.display());
+        println!(
+            "  Config:      kept (user-deletable) ({})",
+            config_path.display()
+        );
     }
     Ok(())
 }
@@ -1258,7 +1311,11 @@ pub fn uninstall_all(_args: &UninstallArgs) -> Result<()> {
             }
         }
     }
-    println!("Removed {} service(s) and the shared files in {}.", removed, dir.display());
+    println!(
+        "Removed {} service(s) and the shared files in {}.",
+        removed,
+        dir.display()
+    );
     Ok(())
 }
 
@@ -1277,8 +1334,7 @@ pub fn control_service(cmd: crate::cli::ServiceCmd) -> Result<()> {
     let targets: Vec<(String, crate::config_edit::ServiceRole)> = if args.all {
         crate::config_edit::list_installed_services()?
     } else {
-        let path =
-            crate::config_edit::resolve_service_config(None, args.name.as_deref())?;
+        let path = crate::config_edit::resolve_service_config(None, args.name.as_deref())?;
         let name = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -1389,7 +1445,10 @@ pub fn upgrade_binary() -> Result<()> {
         Ok(())
     })();
     if let Err(e) = update_result {
-        warn!("binary update failed: {:#}; restarting services best-effort", e);
+        warn!(
+            "binary update failed: {:#}; restarting services best-effort",
+            e
+        );
         let restarted = start_services_best_effort(&manager, &services);
         warn!("restarted {} service(s) after the failed update", restarted);
         return Err(e);
@@ -1430,8 +1489,7 @@ fn start_services_best_effort(
 
 /// Whether a named SCM service exists (read-only query, no admin needed).
 fn service_exists(service_name: &str) -> bool {
-    let Ok(manager) =
-        ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+    let Ok(manager) = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
     else {
         return false;
     };
@@ -1441,10 +1499,7 @@ fn service_exists(service_name: &str) -> bool {
 }
 
 /// Stop a service and wait until it reports Stopped (bounded).
-fn stop_and_wait(
-    service: &windows_service::service::Service,
-    name: &str,
-) -> Result<()> {
+fn stop_and_wait(service: &windows_service::service::Service, name: &str) -> Result<()> {
     let status = service
         .query_status()
         .with_context(|| format!("failed to query status of '{}'", name))?;
@@ -1463,7 +1518,11 @@ fn stop_and_wait(
             return Ok(());
         }
         if Instant::now() >= deadline {
-            bail!("service '{}' did not stop within {:?}", name, STOP_WAIT_TIMEOUT);
+            bail!(
+                "service '{}' did not stop within {:?}",
+                name,
+                STOP_WAIT_TIMEOUT
+            );
         }
         std::thread::sleep(STOP_POLL_INTERVAL);
     }
@@ -1482,7 +1541,11 @@ fn grant_users_modify(path: &Path) {
         .status();
     match status {
         Ok(s) if s.success() => info!("granted Users modify on {}", path.display()),
-        Ok(s) => warn!("icacls failed granting Users modify on {} (exit {})", path.display(), s),
+        Ok(s) => warn!(
+            "icacls failed granting Users modify on {} (exit {})",
+            path.display(),
+            s
+        ),
         Err(e) => warn!("failed to run icacls on {}: {}", path.display(), e),
     }
 }
@@ -1493,10 +1556,13 @@ fn grant_users_modify(path: &Path) {
 /// doing it again.
 pub fn elevate_for_config_if_needed(path: &Path) -> Result<bool> {
     if !crate::config_edit::writable_by_current_user(path) && !is_elevated() {
-        println!("Requesting administrator rights (UAC) to modify the service config...");
-        let output =
-            relaunch_elevated_wait(&std::env::args_os().skip(1).collect::<Vec<_>>())?;
-        print!("{}", output);
+        if crate::is_json_mode() {
+            eprintln!("Requesting administrator rights (UAC) to modify the service config...");
+        } else {
+            println!("Requesting administrator rights (UAC) to modify the service config...");
+        }
+        let output = relaunch_elevated_wait(&std::env::args_os().skip(1).collect::<Vec<_>>())?;
+        replay_elevated_output(&output)?;
         return Ok(true);
     }
     Ok(false)
@@ -1532,12 +1598,8 @@ pub fn redirect_stdio_to_file(path: &Path) {
                         .file_stem()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "rathole-x-elev".to_owned());
-                    candidate = candidate.with_file_name(format!(
-                        "{}-{}-{}.log",
-                        stem,
-                        nanos,
-                        attempt
-                    ));
+                    candidate =
+                        candidate.with_file_name(format!("{}-{}-{}.log", stem, nanos, attempt));
                 }
                 Err(_) => return,
             }
@@ -1555,6 +1617,153 @@ pub fn redirect_stdio_to_file(path: &Path) {
     let mut file = file;
     let _ = file.write_all(b"");
     std::mem::forget(file);
+}
+/// The local status pipe has no command surface: every authenticated caller
+/// can request exactly one bounded snapshot. `AU` covers local authenticated
+/// logons; the pipe also grants Administrators and LocalSystem. Remote
+/// clients are rejected separately by the pipe creation flag.
+const STATUS_PIPE_SDDL: &str = "D:P(A;;GRGW;;;AU)(A;;GA;;;BA)(A;;GA;;;SY)";
+
+fn create_status_pipe(endpoint: &str, first_instance: bool) -> Result<NamedPipeServer> {
+    let pipe_name: Vec<u16> = OsStr::new(endpoint).encode_wide().chain(Some(0)).collect();
+    let mut descriptor = std::ptr::null_mut();
+    // SAFETY: both the pipe name and SDDL are nul-terminated. Windows copies
+    // the descriptor while creating the pipe, so it is released immediately
+    // after CreateNamedPipeW returns.
+    let sddl: Vec<u16> = STATUS_PIPE_SDDL.encode_utf16().chain(Some(0)).collect();
+    let descriptor_ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    };
+    if descriptor_ok == 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to build status pipe ACL");
+    }
+    let security = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let access = PIPE_ACCESS_DUPLEX
+        | FILE_FLAG_OVERLAPPED
+        | if first_instance {
+            FILE_FLAG_FIRST_PIPE_INSTANCE
+        } else {
+            0
+        };
+    let mode = PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
+    let handle = unsafe {
+        CreateNamedPipeW(
+            pipe_name.as_ptr(),
+            access,
+            mode,
+            PIPE_UNLIMITED_INSTANCES,
+            MAX_STATUS_RESPONSE as u32 + 4,
+            STATUS_REQUEST.len() as u32,
+            0,
+            &security,
+        )
+    };
+    // SAFETY: descriptor was allocated by ConvertStringSecurityDescriptor...
+    unsafe { LocalFree(descriptor) };
+    if handle == -1isize as HANDLE {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to create runtime status endpoint {}", endpoint));
+    }
+    // SAFETY: CreateNamedPipeW returned an owned, overlapped named-pipe
+    // handle; Tokio takes ownership and closes it on drop.
+    unsafe { NamedPipeServer::from_raw_handle(handle as RawHandle) }
+        .with_context(|| format!("failed to adopt runtime status endpoint {}", endpoint))
+}
+
+async fn answer_status_request(
+    mut pipe: tokio::net::windows::named_pipe::NamedPipeServer,
+    registry: RuntimeRegistry,
+) {
+    let mut request = [0u8; STATUS_REQUEST.len()];
+    if pipe.read_exact(&mut request).await.is_err() || request != STATUS_REQUEST {
+        return;
+    }
+    let response = match serde_json::to_vec(&snapshot(&registry)) {
+        Ok(response) if response.len() <= MAX_STATUS_RESPONSE => response,
+        Ok(_) => {
+            error!("runtime status snapshot exceeds its bounded response size");
+            return;
+        }
+        Err(error) => {
+            error!("failed to serialize runtime status snapshot: {}", error);
+            return;
+        }
+    };
+    let len = (response.len() as u32).to_le_bytes();
+    if pipe.write_all(&len).await.is_ok() {
+        let _ = pipe.write_all(&response).await;
+    }
+}
+
+/// Start the ACL-protected, local-only status endpoint for this runtime
+/// generation. Failure to expose status never interrupts proxy traffic.
+pub fn spawn_runtime_status_server(
+    config_path: PathBuf,
+    registry: RuntimeRegistry,
+    mut shutdown_rx: broadcast::Receiver<bool>,
+) -> Result<()> {
+    let endpoint = endpoint_for_config(&config_path);
+    let initial = create_status_pipe(&endpoint, true)?;
+    tokio::spawn(async move {
+        let mut listener = initial;
+        loop {
+            tokio::select! {
+                result = listener.connect() => {
+                    if let Err(error) = result {
+                        warn!("runtime status pipe connection failed: {}", error);
+                        break;
+                    }
+                    let connected = listener;
+                    match create_status_pipe(&endpoint, false) {
+                        Ok(next) => listener = next,
+                        Err(error) => {
+                            error!("runtime status pipe cannot accept another request: {:#}", error);
+                            break;
+                        }
+                    }
+                    tokio::spawn(answer_status_request(connected, registry.clone()));
+                }
+                _ = shutdown_rx.recv() => break,
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Query the fixed local pipe verb. A missing/stopped endpoint is returned as
+/// an error so `status` can render `runtime: null` without failing the static
+/// SCM/config query.
+pub fn query_runtime_status(config_path: &Path) -> Result<RuntimeSnapshot> {
+    let endpoint = endpoint_for_config(config_path);
+    let mut pipe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&endpoint)
+        .with_context(|| format!("runtime status unavailable at {}", endpoint))?;
+    pipe.write_all(STATUS_REQUEST)
+        .context("failed to request runtime status")?;
+    pipe.flush()
+        .context("failed to flush runtime status request")?;
+    let mut length = [0u8; 4];
+    pipe.read_exact(&mut length)
+        .context("failed to read runtime status response length")?;
+    let length = u32::from_le_bytes(length) as usize;
+    if length > MAX_STATUS_RESPONSE {
+        bail!("runtime status response exceeds the maximum size");
+    }
+    let mut response = vec![0; length];
+    pipe.read_exact(&mut response)
+        .context("failed to read runtime status response")?;
+    serde_json::from_slice(&response).context("invalid runtime status response")
 }
 
 #[cfg(test)]
@@ -1611,21 +1820,27 @@ mod tests {
         std::fs::write(&exe, b"x").unwrap();
         std::fs::write(&config, b"y").unwrap();
 
-        write_uninstall_bat(&exe, &config, "relay", crate::config_edit::ServiceRole::Server);
+        write_uninstall_bat(
+            &exe,
+            &config,
+            "relay",
+            crate::config_edit::ServiceRole::Server,
+        );
 
         let bat = std::fs::read_to_string(dir.join("uninstall-relay.bat")).unwrap();
         assert!(bat.contains("service uninstall --yes --name \"relay\""));
         assert!(bat.contains("--config \"%~dp0cfg.toml\""));
         assert!(bat.contains("--purge"), "purge hint documented in the bat");
         assert!(bat.contains("rathole-x.exe"));
-        assert!(bat.contains("rathole-x-server-relay"), "SCM name in the bat");
+        assert!(
+            bat.contains("rathole-x-server-relay"),
+            "SCM name in the bat"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     fn setup(dir: &Path) -> PathBuf {
-
-
         std::fs::create_dir_all(dir).unwrap();
         let config = dir.join("config.toml");
         let auth = dir.join("version.toml");
@@ -1651,7 +1866,10 @@ mod tests {
         remove_service_files(&config, false);
 
         assert!(config.exists(), "config kept without --purge");
-        assert!(!dir.join("version.toml").exists(), "version.toml always removed");
+        assert!(
+            !dir.join("version.toml").exists(),
+            "version.toml always removed"
+        );
         assert!(
             dir.join("config.tmp4242").exists(),
             "tmp files kept without --purge"
@@ -1745,7 +1963,10 @@ mod tests {
         assert_eq!(plain, ["service", "uninstall", "--yes"]);
 
         // A trailing flag without a value is dropped too.
-        let args: Vec<OsString> = ["status", "--elevated-log"].iter().map(OsString::from).collect();
+        let args: Vec<OsString> = ["status", "--elevated-log"]
+            .iter()
+            .map(OsString::from)
+            .collect();
         assert_eq!(strip_relay_flags(&args).len(), 1);
 
         // No relay flag: unchanged.
@@ -1799,17 +2020,15 @@ mod tests {
         // (The /setowner step of the real lockdown is skipped: setting the
         // owner to Administrators needs an elevated token; the preserved
         // DACL is what makes this test's comparison meaningful.)
-        for args in [
-            vec![
-                "/inheritance:r",
-                "/grant",
-                "*S-1-5-32-544:F",
-                "/grant",
-                "*S-1-5-18:R",
-                "/grant",
-                "*S-1-5-32-545:M",
-            ],
-        ] {
+        for args in [vec![
+            "/inheritance:r",
+            "/grant",
+            "*S-1-5-32-544:F",
+            "/grant",
+            "*S-1-5-18:R",
+            "/grant",
+            "*S-1-5-32-545:M",
+        ]] {
             let mut cmd = std::process::Command::new("icacls");
             cmd.arg(&target);
             for a in args {
@@ -1923,5 +2142,30 @@ mod tests {
             cmd_string(&cmds[5]),
             "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:R /grant *S-1-5-32-545:M"
         );
+    }
+    #[tokio::test]
+    async fn runtime_status_pipe_round_trip_and_missing_endpoint() {
+        let dir = std::env::temp_dir().join(format!(
+            "rathole-x-status-pipe-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("service.toml");
+        std::fs::write(&config, "[client]\nremote_addr = \"127.0.0.1:1\"\n").unwrap();
+        assert!(query_runtime_status(&config).is_err());
+
+        let registry =
+            crate::runtime_status::client_registry("127.0.0.1:2333", ["demo".to_owned()]);
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        spawn_runtime_status_server(config.clone(), registry, shutdown_rx).unwrap();
+        let queried_config = config.clone();
+        let snapshot = tokio::task::spawn_blocking(move || query_runtime_status(&queried_config))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.services.len(), 1);
+        let _ = shutdown_tx.send(true);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

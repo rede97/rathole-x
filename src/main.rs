@@ -1,12 +1,39 @@
+use std::ffi::OsString;
+
 use anyhow::Result;
-use clap::Parser;
+use clap::{error::ErrorKind, Parser};
 use rathole::{run, Cli};
 use tokio::{signal, sync::broadcast};
 use tracing_subscriber::EnvFilter;
 
+fn argv_requests_json(args: &[OsString]) -> bool {
+    args.iter().any(|arg| arg == "--json")
+}
+
+fn exit_after_parse_error(error: clap::Error, json: bool) -> ! {
+    let human_help = matches!(
+        error.kind(),
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+    );
+    if json && !human_help {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": false,
+                "error": { "message": error.to_string().trim() },
+            })
+        );
+    }
+    let code = if human_help { 0 } else { 2 };
+    let _ = error.print();
+    std::process::exit(code);
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Cli::parse();
+    let raw_args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let args = Cli::try_parse()
+        .unwrap_or_else(|error| exit_after_parse_error(error, argv_requests_json(&raw_args)));
     // The UAC elevation relay: the elevated child runs hidden and writes all
     // its output into a log file that the waiting parent replays.
     if let Some(path) = &args.elevated_log {
@@ -55,4 +82,21 @@ async fn main() -> Result<()> {
     run(args, shutdown_rx).await
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn raw_argv_detects_json_before_clap_reports_an_error() {
+        assert!(argv_requests_json(&[
+            OsString::from("config"),
+            OsString::from("list"),
+            OsString::from("--json"),
+            OsString::from("--unknown"),
+        ]));
+        assert!(!argv_requests_json(&[
+            OsString::from("config"),
+            OsString::from("list")
+        ]));
+    }
+}

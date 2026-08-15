@@ -70,8 +70,8 @@ fn load_client_config(config: &TlsConfig) -> Result<Option<ClientConfig>> {
             .with_context(|| format!("Failed to open `tls.trusted_root` {}", path))?;
         // Trust every certificate in the PEM bundle, not just the first one
         for cert in rustls_pemfile::certs(&mut std::io::BufReader::new(file)) {
-            let cert = cert
-                .with_context(|| format!("Failed to parse a certificate in {}", path))?;
+            let cert =
+                cert.with_context(|| format!("Failed to parse a certificate in {}", path))?;
             root_certs
                 .add(cert)
                 .with_context(|| format!("Failed to trust a certificate in {}", path))?;
@@ -170,8 +170,9 @@ impl Transport for TlsTransport {
         let connector = match self.connector.as_ref() {
             Some(c) => c,
             None => {
-                let client_config = load_client_config(&self.config)?
-                    .ok_or_else(|| anyhow!("No tls client config available for running as a client"))?;
+                let client_config = load_client_config(&self.config)?.ok_or_else(|| {
+                    anyhow!("No tls client config available for running as a client")
+                })?;
                 built = Arc::new(client_config).into();
                 &built
             }

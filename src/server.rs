@@ -8,6 +8,7 @@ use crate::protocol::{
     self, read_auth, read_hello, Ack, ControlChannelCmd, DataChannelCmd, Hello, UdpTraffic,
     HASH_WIDTH_IN_BYTES,
 };
+use crate::runtime_status::{self, RuntimeRegistry};
 use crate::transport::{SocketOpts, TcpTransport, Transport};
 use anyhow::{anyhow, bail, Context, Result};
 use backoff::backoff::Backoff;
@@ -34,13 +35,13 @@ type ServiceDigest = protocol::Digest; // SHA256 of a service name
 type Nonce = protocol::Digest; // Also called `session_key`
 
 const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP servies
-// The UDP pool consumes exactly one data channel (see run_udp_connection_pool),
-// so prefetch only one; a second channel would be created but never used
+                                // The UDP pool consumes exactly one data channel (see run_udp_connection_pool),
+                                // so prefetch only one; a second channel would be created but never used
 const UDP_POOL_SIZE: usize = 1;
 const CHAN_SIZE: usize = 2048; // The capacity of various chans
 const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
-// Timeout for the whole hello/auth phase of an incoming connection, so an
-// unauthenticated peer cannot hold the connection (and its fd) forever
+                                  // Timeout for the whole hello/auth phase of an incoming connection, so an
+                                  // unauthenticated peer cannot hold the connection (and its fd) forever
 const HELLO_AUTH_TIMEOUT: u64 = 10;
 
 // The entrypoint of running a server
@@ -48,6 +49,7 @@ pub async fn run_server(
     config: Config,
     shutdown_rx: broadcast::Receiver<bool>,
     update_rx: mpsc::Receiver<ConfigChange>,
+    runtime: RuntimeRegistry,
 ) -> Result<()> {
     let config = match config.server {
             Some(config) => config,
@@ -58,13 +60,13 @@ pub async fn run_server(
 
     match config.transport.transport_type {
         TransportType::Tcp => {
-            let mut server = Server::<TcpTransport>::from(config).await?;
+            let mut server = Server::<TcpTransport>::from(config, runtime).await?;
             server.run(shutdown_rx, update_rx).await?;
         }
         TransportType::Tls => {
             #[cfg(any(feature = "native-tls", feature = "rustls"))]
             {
-                let mut server = Server::<TlsTransport>::from(config).await?;
+                let mut server = Server::<TlsTransport>::from(config, runtime).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
@@ -73,7 +75,7 @@ pub async fn run_server(
         TransportType::Noise => {
             #[cfg(feature = "noise")]
             {
-                let mut server = Server::<NoiseTransport>::from(config).await?;
+                let mut server = Server::<NoiseTransport>::from(config, runtime).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(feature = "noise"))]
@@ -82,7 +84,7 @@ pub async fn run_server(
         TransportType::Websocket => {
             #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
             {
-                let mut server = Server::<WebsocketTransport>::from(config).await?;
+                let mut server = Server::<WebsocketTransport>::from(config, runtime).await?;
                 server.run(shutdown_rx, update_rx).await?;
             }
             #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
@@ -108,6 +110,7 @@ struct Server<T: Transport> {
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     // Wrapper around the transport layer
     transport: Arc<T>,
+    runtime: RuntimeRegistry,
 }
 
 // Generate a hash map of services which is indexed by ServiceDigest
@@ -123,7 +126,7 @@ fn generate_service_hashmap(
 
 impl<T: 'static + Transport> Server<T> {
     // Create a server from `[server]`
-    pub async fn from(config: ServerConfig) -> Result<Server<T>> {
+    pub async fn from(config: ServerConfig, runtime: RuntimeRegistry) -> Result<Server<T>> {
         let config = Arc::new(config);
         let services = Arc::new(RwLock::new(generate_service_hashmap(&config)));
         let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
@@ -133,6 +136,7 @@ impl<T: 'static + Transport> Server<T> {
             services,
             control_channels,
             transport,
+            runtime,
         })
     }
 
@@ -142,12 +146,17 @@ impl<T: 'static + Transport> Server<T> {
         mut shutdown_rx: broadcast::Receiver<bool>,
         mut update_rx: mpsc::Receiver<ConfigChange>,
     ) -> Result<()> {
-        // Listen at `server.bind_addr`
-        let l = self
-            .transport
-            .bind(&self.config.bind_addr)
-            .await
-            .with_context(|| "Failed to listen at `server.bind_addr`")?;
+        // A fresh run must invalidate an older listener snapshot before a
+        // transport bind is attempted.
+        runtime_status::server_listener_pending(&self.runtime);
+        let l = match self.transport.bind(&self.config.bind_addr).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                runtime_status::server_listener_error(&self.runtime, &error);
+                return Err(error).with_context(|| "Failed to listen at `server.bind_addr`");
+            }
+        };
+        runtime_status::server_listener_listening(&self.runtime);
         info!("Listening at {}", self.config.bind_addr);
 
         // Retry at least every 100ms
@@ -192,8 +201,9 @@ impl<T: 'static + Transport> Server<T> {
                                             let services = self.services.clone();
                                             let control_channels = self.control_channels.clone();
                                             let server_config = self.config.clone();
+                                            let runtime = self.runtime.clone();
                                             tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config).await {
+                                                if let Err(err) = handle_connection(conn, addr, services, control_channels, server_config, runtime).await {
                                                     error!("{:#}", err);
                                                 }
                                             }.instrument(info_span!("connection", %addr)));
@@ -222,6 +232,7 @@ impl<T: 'static + Transport> Server<T> {
             }
         }
 
+        runtime_status::server_listener_stopped(&self.runtime);
         info!("Shutdown");
 
         Ok(())
@@ -232,6 +243,7 @@ impl<T: 'static + Transport> Server<T> {
             ConfigChange::ServerChange(server_change) => match server_change {
                 ServerServiceChange::Add(cfg) => {
                     let hash = protocol::digest(cfg.name.as_bytes());
+                    runtime_status::server_add(&self.runtime, cfg.name.clone());
                     let mut wg = self.services.write().await;
                     let _ = wg.insert(hash, cfg);
 
@@ -240,6 +252,7 @@ impl<T: 'static + Transport> Server<T> {
                 }
                 ServerServiceChange::Delete(s) => {
                     let hash = protocol::digest(s.as_bytes());
+                    runtime_status::remove(&self.runtime, &s);
                     let _ = self.services.write().await.remove(&hash);
 
                     let mut wg = self.control_channels.write().await;
@@ -250,28 +263,28 @@ impl<T: 'static + Transport> Server<T> {
         }
     }
 }
-
-// Handle connections to `server.bind_addr`
+// Handle connections to `server.bind_addr`.
 async fn handle_connection<T: 'static + Transport>(
     mut conn: T::Stream,
+    source_addr: std::net::SocketAddr,
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     server_config: Arc<ServerConfig>,
+    runtime: RuntimeRegistry,
 ) -> Result<()> {
     // The hello/auth phase must complete within a deadline; otherwise an
-    // unauthenticated peer sending zero bytes could occupy the connection
-    // (and its fd) forever
+    // unauthenticated peer sending zero bytes could occupy the connection.
     let handshake = async {
-        // Read hello
-        let hello = read_hello(&mut conn).await?;
-        match hello {
+        match read_hello(&mut conn).await? {
             ControlChannelHello(_, service_digest) => {
                 do_control_channel_handshake(
                     conn,
+                    source_addr,
                     services,
                     control_channels,
                     service_digest,
                     server_config,
+                    runtime,
                 )
                 .await?;
             }
@@ -299,13 +312,14 @@ fn digest_eq(a: &protocol::Digest, b: &protocol::Digest) -> bool {
 
 async fn do_control_channel_handshake<T: 'static + Transport>(
     mut conn: T::Stream,
+    source_addr: std::net::SocketAddr,
     services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
     control_channels: Arc<RwLock<ControlChannelMap<T>>>,
     service_digest: ServiceDigest,
     server_config: Arc<ServerConfig>,
+    runtime: RuntimeRegistry,
 ) -> Result<()> {
     info!("Try to handshake a control channel");
-
     T::hint(&conn, SocketOpts::for_control_channel());
 
     // Generate a nonce
@@ -354,28 +368,30 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         conn.write_all(&bincode::serialize(&Ack::Ok).unwrap())
             .await?;
         conn.flush().await?;
-
         info!(service = %service_config.name, "Control channel established");
-        let handle =
-            ControlChannelHandle::new(conn, service_config, server_config.heartbeat_interval);
+        let connected_since =
+            runtime_status::server_connected(&runtime, &service_name, source_addr).ok_or_else(
+                || anyhow!("service {} was removed during authentication", service_name),
+            )?;
+        let handle = ControlChannelHandle::new(
+            conn,
+            service_config,
+            server_config.heartbeat_interval,
+            runtime.clone(),
+            source_addr,
+            connected_since,
+        );
 
         let mut h = control_channels.write().await;
-
-        // If there's already a control channel for the service, then drop the old one.
-        // Because a control channel doesn't report back when it's dead,
-        // the handle in the map could be stall, dropping the old handle enables
-        // the client to reconnect.
+        // A new authenticated control channel supersedes the old one.
         if h.remove1(&service_digest).is_some() {
             warn!(
                 "Dropping previous control channel for service {}",
                 service_name
             );
         }
-
-        // Insert the new handle
         let _ = h.insert(service_digest, session_key, handle);
     }
-
     Ok(())
 }
 
@@ -419,11 +435,13 @@ where
 {
     // Create a control channel handle, where the control channel handling task
     // and the connection pool task are created.
-    #[instrument(name = "handle", skip_all, fields(service = %service.name))]
     fn new(
         conn: T::Stream,
         service: ServerServiceConfig,
         heartbeat_interval: u64,
+        runtime: RuntimeRegistry,
+        source_addr: std::net::SocketAddr,
+        connected_since: u64,
     ) -> ControlChannelHandle<T> {
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
@@ -482,20 +500,42 @@ where
                 .instrument(Span::current()),
             ),
         };
-
-        // Create the control channel
         let ch = ControlChannel::<T> {
             conn,
             shutdown_rx,
             data_ch_req_rx,
             heartbeat_interval,
+            service_name: service.name.clone(),
+            runtime,
+            source_addr,
+            connected_since,
         };
 
         // Run the control channel
         tokio::spawn(
             async move {
-                if let Err(err) = ch.run().await {
+                let runtime = ch.runtime.clone();
+                let service_name = ch.service_name.clone();
+                let source_addr = ch.source_addr;
+                let connected_since = ch.connected_since;
+                let result = ch.run().await;
+                if let Err(err) = &result {
                     error!("{:#}", err);
+                    runtime_status::server_disconnected(
+                        &runtime,
+                        &service_name,
+                        source_addr,
+                        connected_since,
+                        Some(err),
+                    );
+                } else {
+                    runtime_status::server_disconnected(
+                        &runtime,
+                        &service_name,
+                        source_addr,
+                        connected_since,
+                        Some("control channel stopped"),
+                    );
                 }
             }
             .instrument(Span::current()),
@@ -508,15 +548,16 @@ where
         }
     }
 }
-
-// Control channel, using T as the transport layer. P is TcpStream or UdpTraffic
 struct ControlChannel<T: Transport> {
     conn: T::Stream,                               // The connection of control channel
     shutdown_rx: broadcast::Receiver<bool>,        // Receives the shutdown signal
     data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives visitor connections
     heartbeat_interval: u64,                       // Application-layer heartbeat interval in secs
+    service_name: String,
+    runtime: RuntimeRegistry,
+    source_addr: std::net::SocketAddr,
+    connected_since: u64,
 }
-
 impl<T: Transport> ControlChannel<T> {
     async fn write_and_flush(&mut self, data: &[u8]) -> Result<()> {
         write_and_flush(&mut self.conn, data)
@@ -811,6 +852,85 @@ async fn run_udp_connection_pool<T: Transport>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_status::ServerListenerState;
+    fn test_server_config(bind_addr: String) -> ServerConfig {
+        ServerConfig {
+            bind_addr,
+            ..Default::default()
+        }
+    }
+
+    async fn wait_for_listener_state(runtime: &RuntimeRegistry, expected: ServerListenerState) {
+        time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    runtime_status::snapshot(runtime).server_listener,
+                    Some(crate::runtime_status::ServerListenerSnapshot { state, .. })
+                        if state == expected
+                ) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("server listener did not reach expected state");
+    }
+
+    #[tokio::test]
+    async fn listener_state_tracks_successful_bind_and_shutdown() {
+        let runtime = runtime_status::server_registry(std::iter::empty());
+        assert!(matches!(
+            runtime_status::snapshot(&runtime).server_listener,
+            Some(crate::runtime_status::ServerListenerSnapshot {
+                state: ServerListenerState::Pending,
+                ..
+            })
+        ));
+
+        let mut server = Server::<TcpTransport>::from(
+            test_server_config("127.0.0.1:0".to_owned()),
+            runtime.clone(),
+        )
+        .await
+        .unwrap();
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let (_update_tx, update_rx) = mpsc::channel(1);
+        let run = tokio::spawn(async move { server.run(shutdown_rx, update_rx).await });
+        wait_for_listener_state(&runtime, ServerListenerState::Listening).await;
+        assert_eq!(shutdown_tx.send(true).unwrap(), 1);
+        run.await.unwrap().unwrap();
+        assert!(matches!(
+            runtime_status::snapshot(&runtime).server_listener,
+            Some(crate::runtime_status::ServerListenerSnapshot {
+                state: ServerListenerState::Stopped,
+                last_error: None,
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn listener_state_tracks_bind_failure() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let runtime = runtime_status::server_registry(std::iter::empty());
+        let mut server = Server::<TcpTransport>::from(
+            test_server_config(occupied.local_addr().unwrap().to_string()),
+            runtime.clone(),
+        )
+        .await
+        .unwrap();
+        let (_shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        let (_update_tx, update_rx) = mpsc::channel(1);
+
+        assert!(server.run(shutdown_rx, update_rx).await.is_err());
+        assert!(matches!(
+            runtime_status::snapshot(&runtime).server_listener,
+            Some(crate::runtime_status::ServerListenerSnapshot {
+                state: ServerListenerState::Error,
+                last_error: Some(_),
+            })
+        ));
+    }
 
     #[test]
     fn digest_eq_matches_identical_digests() {

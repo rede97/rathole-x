@@ -42,14 +42,12 @@ async fn wrong_token_is_rejected() -> Result<()> {
     let (server_shutdown_tx, server_shutdown_rx) = broadcast::channel(1);
     let (client_shutdown_tx, client_shutdown_rx) = broadcast::channel(1);
 
-    let server = tokio::spawn(async move {
-        run_rathole_server(SERVER_CONFIG, server_shutdown_rx).await
-    });
+    let server =
+        tokio::spawn(async move { run_rathole_server(SERVER_CONFIG, server_shutdown_rx).await });
     wait_control_listener().await?;
 
-    let client = tokio::spawn(async move {
-        run_rathole_client(CLIENT_CONFIG, client_shutdown_rx).await
-    });
+    let client =
+        tokio::spawn(async move { run_rathole_client(CLIENT_CONFIG, client_shutdown_rx).await });
 
     // Let the client burn through several retry rounds with its bad token.
     time::sleep(OBSERVE_WINDOW).await;

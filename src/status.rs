@@ -8,6 +8,7 @@ use serde_json::{json, Map, Value};
 
 use crate::cli::StatusArgs;
 use crate::config::{ClientConfig, Config, ServerConfig, TransportType};
+use crate::runtime_status::{RuntimeServiceSnapshot, RuntimeSnapshot, ServerListenerState};
 
 const GREEN: &str = "32";
 const RED: &str = "31";
@@ -73,7 +74,11 @@ fn transport_label(t: &crate::config::TransportConfig) -> String {
 fn transport_detail(t: &crate::config::TransportConfig) -> Option<String> {
     match t.transport_type {
         TransportType::Noise => {
-            if t.noise.as_ref().map(|n| n.local_private_key.is_some()).unwrap_or(false) {
+            if t.noise
+                .as_ref()
+                .map(|n| n.local_private_key.is_some())
+                .unwrap_or(false)
+            {
                 Some(format!("local key {}", mask()))
             } else if t
                 .noise
@@ -90,19 +95,86 @@ fn transport_detail(t: &crate::config::TransportConfig) -> Option<String> {
             tls.pkcs12
                 .as_ref()
                 .map(|p| format!("pkcs12 {}", p))
-                .or_else(|| tls.trusted_root.as_ref().map(|r| format!("trusted_root {}", r)))
+                .or_else(|| {
+                    tls.trusted_root
+                        .as_ref()
+                        .map(|r| format!("trusted_root {}", r))
+                })
         }),
-        TransportType::Websocket => t
-            .websocket
-            .as_ref()
-            .map(|w| format!("tls = {}", w.tls)),
+        TransportType::Websocket => t.websocket.as_ref().map(|w| format!("tls = {}", w.tls)),
         TransportType::Tcp => None,
     }
 }
 
-fn client_node(c: &ClientConfig) -> Node {
+fn status_badge(ok: bool) -> String {
+    let text = if ok { "status: ok" } else { "status: error" };
+    colorize(text, if ok { GREEN } else { RED })
+}
+
+fn client_service_detail(runtime: Option<&RuntimeSnapshot>, name: &str) -> String {
+    let ok = matches!(
+        runtime.and_then(|snapshot| snapshot.services.get(name)),
+        Some(RuntimeServiceSnapshot::Client {
+            state: crate::runtime_status::ClientControlState::Connected,
+            ..
+        })
+    );
+    format!(" [{}]", status_badge(ok))
+}
+
+fn server_service_detail(runtime: Option<&RuntimeSnapshot>, name: &str) -> String {
+    match runtime.and_then(|snapshot| snapshot.services.get(name)) {
+        Some(RuntimeServiceSnapshot::Server {
+            state: crate::runtime_status::ServerControlState::Connected,
+            control_channel_source,
+            ..
+        }) => format!(
+            " [{}]{}",
+            status_badge(true),
+            control_channel_source
+                .map(|address| format!(" [client: {}]", address))
+                .unwrap_or_default()
+        ),
+        _ => format!(" [{}]", status_badge(false)),
+    }
+}
+
+fn client_remote_detail(runtime: Option<&RuntimeSnapshot>) -> String {
+    let Some(snapshot) = runtime else {
+        return format!(" [{}]", status_badge(false));
+    };
+    let connected = snapshot
+        .services
+        .values()
+        .find_map(|service| match service {
+            RuntimeServiceSnapshot::Client {
+                state: crate::runtime_status::ClientControlState::Connected,
+                resolved_control_target,
+                ..
+            } => *resolved_control_target,
+            _ => None,
+        });
+    match connected {
+        Some(address) => format!(" [{}] [resolved: {}]", status_badge(true), address),
+        None => format!(" [{}]", status_badge(false)),
+    }
+}
+
+fn server_bind_detail(runtime: Option<&RuntimeSnapshot>) -> String {
+    let ok = matches!(
+        runtime.and_then(|snapshot| snapshot.server_listener.as_ref()),
+        Some(listener) if listener.state == ServerListenerState::Listening
+    );
+    format!(" [{}]", status_badge(ok))
+}
+
+fn client_node(c: &ClientConfig, runtime: Option<&RuntimeSnapshot>) -> Node {
     let mut node = Node::new(colorize("[client]", GREEN));
-    node.leaf(format!("remote_addr = {}", c.remote_addr));
+    node.leaf(format!(
+        "remote_addr = {}{}",
+        c.remote_addr,
+        client_remote_detail(runtime)
+    ));
     let transport = format!("transport   = {}", transport_label(&c.transport));
     node.leaf(transport);
     if let Some(detail) = transport_detail(&c.transport) {
@@ -130,15 +202,20 @@ fn client_node(c: &ClientConfig) -> Node {
         if s.token.is_some() {
             label.push_str(&format!(" [token {}]", mask()));
         }
+        label.push_str(&client_service_detail(runtime, name));
         services.leaf(label);
     }
     node.children.push(services);
     node
 }
 
-fn server_node(s: &ServerConfig) -> Node {
+fn server_node(s: &ServerConfig, runtime: Option<&RuntimeSnapshot>) -> Node {
     let mut node = Node::new(colorize("[server]", GREEN));
-    node.leaf(format!("bind_addr   = {}", s.bind_addr));
+    node.leaf(format!(
+        "bind_addr   = {}{}",
+        s.bind_addr,
+        server_bind_detail(runtime)
+    ));
     let transport = format!("transport   = {}", transport_label(&s.transport));
     node.leaf(transport);
     if let Some(detail) = transport_detail(&s.transport) {
@@ -160,6 +237,7 @@ fn server_node(s: &ServerConfig) -> Node {
         if svc.token.is_some() {
             label.push_str(&format!(" [token {}]", mask()));
         }
+        label.push_str(&server_service_detail(runtime, name));
         services.leaf(label);
     }
     node.children.push(services);
@@ -172,6 +250,48 @@ fn auth_info(config_path: &Path) -> (bool, bool) {
         exists,
         crate::config_edit::writable_by_current_user(config_path),
     )
+}
+
+fn runtime_status_for(config_path: &Path) -> (Value, Option<RuntimeSnapshot>, Option<String>) {
+    match crate::platform::query_runtime_status(config_path) {
+        Ok(snapshot) => match serde_json::to_value(&snapshot) {
+            Ok(value) => (value, Some(snapshot), None),
+            Err(error) => (
+                Value::Null,
+                None,
+                Some(format!("invalid local snapshot: {}", error)),
+            ),
+        },
+        Err(error) => (
+            Value::Null,
+            None,
+            Some(format!("local endpoint unavailable: {}", error)),
+        ),
+    }
+}
+
+fn print_runtime_human(runtime: Option<&RuntimeSnapshot>, unavailable: Option<&str>) {
+    match runtime {
+        Some(snapshot) => println!(
+            "Runtime: {} (pid {}, snapshot {})",
+            match snapshot.role {
+                crate::runtime_status::RuntimeRole::Client => "client",
+                crate::runtime_status::RuntimeRole::Server => "server",
+            },
+            snapshot.process_id,
+            snapshot.captured_at_unix_ms
+        ),
+        None => println!(
+            "Runtime: {}",
+            colorize(
+                &format!(
+                    "unavailable — {}",
+                    unavailable.unwrap_or("local endpoint did not return a snapshot")
+                ),
+                YELLOW
+            )
+        ),
+    }
 }
 
 /// Query the Windows service state. `None` when not installed or unreadable.
@@ -188,8 +308,6 @@ fn query_windows_service(name: &str) -> Option<(String, Option<u32>)> {
     let status = service.query_status().ok()?;
     Some((format!("{:?}", status.current_state), status.process_id))
 }
-
-
 
 fn client_json(c: &ClientConfig) -> Value {
     let services: Map<String, Value> = c
@@ -260,57 +378,42 @@ fn render_one(
     config_path: &std::path::Path,
     service: &Option<(String, Option<u32>)>,
     state_known: bool,
-) -> Result<()> {
+) -> Result<Value> {
     let content = std::fs::read_to_string(config_path).ok();
-    let parsed: Option<Config> = content
-        .as_deref()
-        .and_then(|c| toml::from_str(c).ok());
-
+    let parsed: Option<Config> = content.as_deref().and_then(|c| toml::from_str(c).ok());
     let (auth_file_exists, auth_allows_user) = auth_info(config_path);
-
+    let (runtime, runtime_snapshot, runtime_unavailable) = runtime_status_for(config_path);
+    let result = json!({
+        "service": {
+            "name": name,
+            "state": service.as_ref().map(|s| s.0.clone()),
+            "pid": service.as_ref().and_then(|s| s.1),
+        },
+        "config": {
+            "path": config_path,
+            "exists": content.is_some(),
+            "valid": parsed.is_some(),
+            "auth": {
+                "version_file_exists": auth_file_exists,
+                "writable_by_user": auth_allows_user,
+            },
+        },
+        "client": parsed.as_ref().and_then(|c| c.client.as_ref()).map(client_json),
+        "server": parsed.as_ref().and_then(|c| c.server.as_ref()).map(server_json),
+        "runtime": runtime,
+        "runtime_availability": {
+            "available": runtime_snapshot.is_some(),
+            "reason": runtime_unavailable,
+        },
+    });
     if args.json {
-        let mut out = Map::new();
-        out.insert(
-            "service".to_owned(),
-            json!({
-                "name": name,
-                "state": service.as_ref().map(|s| s.0.clone()),
-                "pid": service.as_ref().and_then(|s| s.1),
-            }),
-        );
-        out.insert(
-            "config".to_owned(),
-            json!({
-                "path": config_path,
-                "exists": content.is_some(),
-                "valid": parsed.is_some(),
-                "auth": {
-                    "version_file_exists": auth_file_exists,
-                    "writable_by_user": auth_allows_user,
-                },
-            }),
-        );
-        out.insert(
-            "client".to_owned(),
-            parsed
-                .as_ref()
-                .and_then(|c| c.client.as_ref())
-                .map(client_json)
-                .unwrap_or(Value::Null),
-        );
-        out.insert(
-            "server".to_owned(),
-            parsed
-                .as_ref()
-                .and_then(|c| c.server.as_ref())
-                .map(server_json)
-                .unwrap_or(Value::Null),
-        );
-        println!("{}", serde_json::to_string_pretty(&Value::Object(out))?);
-        return Ok(());
+        return Ok(result);
     }
 
-    println!("{}", colorize(&format!("rathole-x status: {}", name), GREEN));
+    println!(
+        "{}",
+        colorize(&format!("rathole-x status: {}", name), GREEN)
+    );
     println!();
     match service {
         Some((state, pid)) => {
@@ -329,29 +432,26 @@ fn render_one(
             name,
             colorize("unknown (config outside the service directory)", YELLOW)
         ),
-        None => println!(
-            "Service: {} — {}",
-            name,
-            colorize("not installed", YELLOW)
-        ),
+        None => println!("Service: {} — {}", name, colorize("not installed", YELLOW)),
     }
     println!("Config:  {}", config_path.display());
-    let auth = format!(
-        "version stamp: {} | writable by you: {}",
+    println!(
+        "Auth:    version stamp: {} | writable by you: {}",
         if auth_file_exists { "yes" } else { "none" },
         if auth_allows_user { "yes" } else { "no (UAC)" }
     );
-    println!("Auth:    {}", auth);
+    print_runtime_human(runtime_snapshot.as_ref(), runtime_unavailable.as_deref());
     println!();
-
     match &parsed {
         Some(config) => {
             let mut root = Node::new(colorize("config", GREEN));
             if let Some(c) = &config.client {
-                root.children.push(client_node(c));
+                root.children
+                    .push(client_node(c, runtime_snapshot.as_ref()));
             }
             if let Some(s) = &config.server {
-                root.children.push(server_node(s));
+                root.children
+                    .push(server_node(s, runtime_snapshot.as_ref()));
             }
             let mut out = String::new();
             render_tree(&root, "", true, &mut out);
@@ -366,7 +466,7 @@ fn render_one(
             println!("{}", colorize(hint, YELLOW));
         }
     }
-    Ok(())
+    Ok(result)
 }
 
 /// SCM state of the named service, inferred from the role found in its
@@ -394,10 +494,9 @@ fn service_state_for(name: &str, config_path: &Path) -> Option<(String, Option<u
     }
 }
 
-pub fn run_status(args: &StatusArgs) -> Result<()> {
+pub fn run_status(args: &StatusArgs) -> Result<Value> {
     if let Some(name) = &args.name {
         crate::config_edit::validate_service_name(name)?;
-        // An explicit `-c` overrides the default service config location.
         let config_path = match &args.config {
             Some(p) => p.clone(),
             None => crate::config_edit::config_dir().join(format!("{}.toml", name)),
@@ -405,18 +504,13 @@ pub fn run_status(args: &StatusArgs) -> Result<()> {
         let service = service_state_for(name, &config_path);
         return render_one(args, name, &config_path, &service, true);
     }
-
-    // `-c` without --name: render that file's config tree directly. The SCM
-    // state is only inferred when the file lives in the service config
-    // directory; otherwise it is reported as unknown.
     if let Some(config_path) = &args.config {
         let name = config_path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("config")
             .to_owned();
-        let state_known =
-            config_path.parent() == Some(crate::config_edit::config_dir().as_path());
+        let state_known = config_path.parent() == Some(crate::config_edit::config_dir().as_path());
         let service = if state_known {
             service_state_for(&name, config_path)
         } else {
@@ -424,63 +518,63 @@ pub fn run_status(args: &StatusArgs) -> Result<()> {
         };
         return render_one(args, &name, config_path, &service, state_known);
     }
-
-    // List mode: every installed service.
     let services = crate::config_edit::list_installed_services()?;
-    if args.json {
-        let arr: Vec<Value> = services
-            .iter()
-            .map(|(name, role)| {
+    let arr: Vec<Value> = services
+        .iter()
+        .map(|(name, role)| {
+            #[cfg(windows)]
+            let svc = query_named_service(role.key(), name);
+            #[cfg(not(windows))]
+            let svc: Option<(String, Option<u32>)> = None;
+            let config_path = crate::config_edit::config_dir().join(format!("{}.toml", name));
+            let (runtime, runtime_snapshot, runtime_unavailable) = runtime_status_for(&config_path);
+            json!({
+                "name": name,
+                "role": role.key(),
+                "state": svc.as_ref().map(|s| s.0.clone()),
+                "pid": svc.as_ref().and_then(|s| s.1),
+                "runtime": runtime,
+                "runtime_availability": {
+                    "available": runtime_snapshot.is_some(),
+                    "reason": runtime_unavailable,
+                },
+            })
+        })
+        .collect();
+    if !args.json {
+        println!("{}", colorize("rathole-x services", GREEN));
+        println!();
+        if arr.is_empty() {
+            println!(
+                "{}",
+                colorize(
+                    "no installed services — run `rathole-x service install server|client --yes`",
+                    YELLOW
+                )
+            );
+        } else {
+            for ((name, role), detail) in services.iter().zip(&arr) {
                 #[cfg(windows)]
                 let svc = query_named_service(role.key(), name);
                 #[cfg(not(windows))]
                 let svc: Option<(String, Option<u32>)> = None;
-                json!({
-                    "name": name,
-                    "role": role.key(),
-                    "state": svc.as_ref().map(|s| s.0.clone()),
-                    "pid": svc.as_ref().and_then(|s| s.1),
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&arr)?);
-        return Ok(());
+                let state = match &svc {
+                    Some((s, Some(pid))) => format!("{} (pid {})", s, pid),
+                    Some((s, None)) => s.clone(),
+                    None => "not installed".to_owned(),
+                };
+                let runtime = detail["runtime"]
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .map(|role| format!("runtime {}", role))
+                    .unwrap_or_else(|| "runtime unavailable".to_owned());
+                println!("{:12} {:8} {} | {}", name, role.key(), state, runtime);
+            }
+            println!();
+            println!("Run `rathole-x status --name <name>` for the full config tree.");
+        }
     }
-
-    println!("{}", colorize("rathole-x services", GREEN));
-    println!();
-    if services.is_empty() {
-        println!(
-            "{}",
-            colorize(
-                "no installed services — run `rathole-x service install server|client --yes`",
-                YELLOW
-            )
-        );
-        return Ok(());
-    }
-    for (name, role) in &services {
-        #[cfg(windows)]
-        let svc = query_named_service(role.key(), name);
-        #[cfg(not(windows))]
-        let svc: Option<(String, Option<u32>)> = None;
-        let state = match &svc {
-            Some((s, pid)) => match pid {
-                Some(pid) => format!("{} (pid {})", s, pid),
-                None => s.clone(),
-            },
-            None => "not installed".to_owned(),
-        };
-        let colored = match state.as_str() {
-            "Running" => colorize(&state, GREEN),
-            "Stopped" => colorize(&state, RED),
-            _ => state,
-        };
-        println!("{:12} {:8} {}", name, role.key(), colored);
-    }
-    println!();
-    println!("Run `rathole-x status --name <name>` for the full config tree.");
-    Ok(())
+    Ok(json!({"services": arr}))
 }
 
 #[cfg(test)]
@@ -501,10 +595,8 @@ token = "abc"
     /// reported as unknown instead of "not installed").
     #[test]
     fn status_config_without_name_renders_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "rathole-x-status-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rathole-x-status-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("demo.toml");
         std::fs::write(&path, CLIENT_TOML).unwrap();
@@ -515,7 +607,11 @@ token = "abc"
                 name: None,
                 json,
             };
-            run_status(&args).unwrap();
+            let result = run_status(&args).unwrap();
+            if json {
+                assert!(result["runtime"].is_null());
+                assert_eq!(result["runtime_availability"]["available"], false);
+            }
         }
 
         // `--name` combined with `-c` prefers the explicit file.
@@ -524,9 +620,58 @@ token = "abc"
             name: Some("demo".to_owned()),
             json: true,
         };
-        run_status(&args).unwrap();
+        let result = run_status(&args).unwrap();
+        assert!(result["runtime"].is_null());
 
         std::fs::remove_dir_all(&dir).ok();
     }
-}
+    #[test]
+    fn runtime_badges_reflect_client_and_server_state() {
+        let client = RuntimeSnapshot {
+            schema_version: crate::runtime_status::RUNTIME_SCHEMA_VERSION,
+            role: crate::runtime_status::RuntimeRole::Client,
+            process_id: 1,
+            captured_at_unix_ms: 1,
+            server_listener: None,
+            services: [(
+                "demo".to_owned(),
+                RuntimeServiceSnapshot::Client {
+                    state: crate::runtime_status::ClientControlState::Connected,
+                    configured_control_target: "example.test:2333".to_owned(),
+                    resolved_control_target: Some("127.0.0.1:2333".parse().unwrap()),
+                    last_connected_at_unix_ms: Some(1),
+                    last_error: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        assert_eq!(
+            client_remote_detail(Some(&client)),
+            " [status: ok] [resolved: 127.0.0.1:2333]"
+        );
+        assert_eq!(
+            client_service_detail(Some(&client), "demo"),
+            " [status: ok]"
+        );
 
+        let mut server = RuntimeSnapshot {
+            schema_version: crate::runtime_status::RUNTIME_SCHEMA_VERSION,
+            role: crate::runtime_status::RuntimeRole::Server,
+            process_id: 2,
+            captured_at_unix_ms: 2,
+            server_listener: Some(crate::runtime_status::ServerListenerSnapshot {
+                state: ServerListenerState::Pending,
+                last_error: None,
+            }),
+            services: std::collections::BTreeMap::new(),
+        };
+        assert_eq!(server_bind_detail(Some(&server)), " [status: error]");
+        server.server_listener = Some(crate::runtime_status::ServerListenerSnapshot {
+            state: ServerListenerState::Listening,
+            last_error: None,
+        });
+        assert_eq!(server_bind_detail(Some(&server)), " [status: ok]");
+        assert_eq!(server_bind_detail(None), " [status: error]");
+    }
+}

@@ -22,7 +22,7 @@ rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://g
 
 - **单一二进制、子命令驱动的 CLI。** 对人友好：交互式提示 + 自动生成的 token 与 noise 密钥。对脚本/Agent 友好：所有操作都有对应 flag，支持 `--json` 输出与 `--yes` 非交互模式。
 - **免手写配置文件。** `service install <server|client>` 部署系统服务并创建角色专属的骨架配置；`config add`/`config set` 管理全部内容；热重载无需重启即可应用变更。
-- **一个服务一个角色。** 每个已安装服务只运行一个角色（server 或 client），拥有各自的配置文件；同一台机器需要同时运行 server 与 client 时安装两个服务即可——各服务可独立安装、升级与观测（Unix 哲学）。前台守护进程（`run`）仍支持单配置双段、单进程同时运行两段。
+- **一个进程一个角色。** 每个前台或已安装进程只运行 server 或 client 之一，并使用角色专属配置；同一主机需要两种角色时配置并运行两个独立进程。
 - **与上游兼容的线协议。** `rathole-x` 使用与上游 rathole 相同的线协议，因此二者可互通。
 - **平台集成。** Windows SCM 服务 + UAC 提权；Linux systemd 已规划（见 [docs/plan-linux-service.md](docs/plan-linux-service.md)）。
 - **安全默认值。** token 为必填；配置编辑受实际文件权限约束——CLI 会探测当前用户是否可写该配置，仅当不可写时才提权（UAC）；服务二进制被复制到 `ProgramData`，非管理员无法替换。
@@ -30,7 +30,7 @@ rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://g
 ## New features over upstream
 
 - **子命令驱动的 CLI** — `run`（运行守护进程）、`config add|remove|list|set`（管理服务配置）、`status`（服务状态 + 配置树）、`genkey`（生成 noise 密钥对）、`service install|uninstall|start|stop|restart`（系统服务生命周期）、`upgrade`（更新已安装二进制）。各 flag 见 [CLI reference](#cli-reference)。
-- **双模式（仅守护进程）** — `run` 在配置同时含两段时单进程运行 server 与 client；已安装的系统服务严格单角色，双角色需求通过安装两个服务实现。
+- **单角色执行** — 同时含 `[server]` 与 `[client]` 的手写配置必须显式使用 `run --server` 或 `run --client`；常规部署使用两个独立配置的进程。
 - **自动生成 token 与 noise 密钥** — `config add`/`config set` 在省略时自动生成。
 - **原子写入热重载** — `config add`/`config set`/`config remove` 原子重写配置；运行中的服务无需重启即热重载。
 - **Windows 服务安装** — `service install server|client --name <n>` 注册一个命名 SCM 服务（AutoStart，SCM 名称为 `rathole-x-<role>-<N>`），拥有各自独立的配置文件；二进制被复制到配置旁，非管理员不可替换；每个服务写入一个 `uninstall-<n>.bat`；是否允许非管理员编辑配置由实际权限决定（无策略文件）。
@@ -55,8 +55,9 @@ rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://g
 # 服务端（公网 IP）：将 5202 端口暴露到互联网
 ./rathole-x config add --name relay --server "name:my_nas_ssh;bind:0.0.0.0:5202"
 
-# 客户端（NAT 之后）：转发到 NAS 上 22 端口的 ssh 守护进程
-./rathole-x config add --name home-nas --client "server:myserver.com:2333;name:my_nas_ssh;local:127.0.0.1:22"
+# 客户端（NAT 之后）：先指向服务器（一次），再转发到 NAS 上 22 端口的 ssh 守护进程
+./rathole-x config set --name home-nas --client --remote-addr myserver.com:2333
+./rathole-x config add --name home-nas --client "name:my_nas_ssh;local:127.0.0.1:22"
 ```
 
 3. 查看服务状态与配置树：
@@ -87,6 +88,12 @@ Reinstall the service to upgrade: `rathole-x service uninstall --yes` then `rath
 
 **开发者规则：任何破坏性的配置 schema 变更（重命名/删除/重新打标签的字段、语义或默认值变更）都必须升级大版本号。** 纯增量变更（带 serde 默认值的新可选字段）则无需升级。版本戳存放在 `version.toml` 中，因此 rathole 配置文件本身仍可被上游 rathole 100% 解析。
 
+## 运行时连接状态
+
+Windows 上，`status` 还会查询由规范化配置路径派生、受 ACL 保护的本地命名管道。`runtime` 是本机快照而非网络探测：包含 schema 版本、角色、进程 ID 与采集时间；client 服务包含 `connecting`、`connected`、`retrying` 或 `stopped`，以及已配置/已解析的**控制通道目标**和连接/错误时间；server 服务包含 `waiting`、`connected` 或 `stopped`，以及已认证控制通道的来源地址和连接/断开元数据。不会暴露 token、密钥、载荷或流量。
+
+进程已停止、仍是旧二进制、使用另一份配置或端点尚未就绪时，`runtime: null` 属于正常结果；`runtime_availability.reason` 给出原因而不会使静态状态查询失败。Linux/systemd 端点仍在计划中。
+
 ## Service lifecycle
 
 - `rathole-x service start|stop|restart [--name N | --all]` — 驱动已安装服务的 SCM 状态（需要时 UAC 提权）。
@@ -100,7 +107,9 @@ Reinstall the service to upgrade: `rathole-x service uninstall --yes` then `rath
 
 ```bash
 # 按名称添加服务；省略时自动生成 token。
-./rathole-x config add --client "server:myserver.com:2333;name:my_nas_ssh;local:127.0.0.1:22"
+#（client 添加前需先设置控制通道服务器：
+#  `config set --client --remote-addr myserver.com:2333`）
+./rathole-x config add --client "name:my_nas_ssh;local:127.0.0.1:22"
 
 # 无需编辑文件即可调整 [client]/[server] 全局字段与传输协议
 ./rathole-x config set --server --bind-addr 0.0.0.0:2333 --noise            # 生成 noise 密钥对
@@ -118,17 +127,18 @@ Reinstall the service to upgrade: `rathole-x service uninstall --yes` then `rath
 
 # 当缺少 flag 且存在 TTY 时使用交互式提示；
 # 脚本可传入所有 flag 并通过 --json 读取机器可读输出。
-./rathole-x config add --client "server:myserver.com:2333;name:my_nas_ssh;local:127.0.0.1:22" --json
+./rathole-x config add --client "name:my_nas_ssh;local:127.0.0.1:22" --json
 
-# 为同一台服务器批量添加多个服务（一次写入）
-./rathole-x config add --client "server:srv-a.com:2333;name:nas;local:127.0.0.1:22" \
-  --client "server:srv-a.com:2333;name:db;local:127.0.0.1:5432"
+# 批量添加多个服务（一次写入；控制通道服务器是全局单值，
+# 先用 `config set --client --remote-addr` 设置一次）
+./rathole-x config add --client "name:nas;local:127.0.0.1:22" \
+  --client "name:db;local:127.0.0.1:5432"
 
 # 生成 noise 密钥对（替代已移除的 --genkey flag）
 ./rathole-x genkey
 
-# 单进程同时服务 [server] 与 [client] 两段
-./rathole-x run -c config.toml
+# 每个 run 进程只运行一个角色；双段手写配置必须显式选择角色。
+./rathole-x run --server -c server.toml
 # 安装命名服务：每个服务恰好一个角色，每个服务一个配置文件。
 # 自动创建角色专属的骨架配置。
 ./rathole-x service install server --yes --name relay
@@ -146,11 +156,11 @@ Reinstall the service to upgrade: `rathole-x service uninstall --yes` then `rath
 
 ## CLI reference
 
-`config add|remove|list|set` 与 `status` 接受 `--json` 以获得机器可读输出；`service install`、`service uninstall` 与 `upgrade` 在运行前确认——TTY 下弹交互式确认，`--yes`（或 `RATHOLE_X_CONFIRMED=1`）跳过确认，非交互 shell 不传 `--yes` 时只打印用法。上游的位置参数形式 `./rathole config.toml` 在本分支中**不受支持**——用 `run -c CONFIG` 运行守护进程（不带 `-c` 时使用系统默认路径：Windows 为 `%ProgramData%\rathole-x\rathole-x.toml`，Linux 为 `/etc/rathole-x.toml`）。带 `--name` 的命令操作同名的已安装服务；同时省略 `--name` 与 `-c` 且恰好只安装了一个服务时，自动使用该服务。
+`config add|remove|list|set`、`status`、服务生命周期命令和 `upgrade` 都支持 `--json`。JSON 的 stdout 严格只有一个封套：`{ "ok": true, "result": ... }` 或 `{ "ok": false, "error": { "message": ... } }`；进度与诊断不写入 stdout。`config remove`、service install/uninstall 和 upgrade 需要确认；JSON 或无人值守时必须传 `--yes`，否则返回可执行的错误。
 
-- `run [-c CONFIG] [--server|--client]` — 运行守护进程；`--server`/`--client` 强制指定模式。双段配置在单进程中同时运行两段。
-- `config add [<NAME>] [--client SPEC]... [--server SPEC]... [--remote-addr A] [--bind-addr A] [--local-addr A] [--token T] [--noise] [--noise-key K] [--type tcp|udp] [-c] [--name N] [--json] [--yes]` — 按名称和 flag 添加服务，或通过可重复的 `--client "server:...;name:...;local:...;token:...;type:..."` / `--server "name:...;bind:...;token:...;type:..."` 规格批量添加（一次写入、一次热重载）。在 TTY 中不指定名称时，会运行多轮交互式向导（空名称结束）。一个 client 配置只连接一个服务器（与上游一致）：规格的 `server:` 键在全新段上设置 `[client] remote_addr` 默认值；段已存在时必须与其一致——要使用另一台服务器，请安装独立的服务实例（`service install client --name <N>`）。
-- `config remove <NAME> [-c] [--name N] [--json]` — 移除服务。
+- `run [-c CONFIG] [--server|--client]` — 只运行一个守护角色；双段配置必须显式给出 `--server` 或 `--client`。
+- `config add [<NAME>] [--client SPEC]... [--server SPEC]... [--bind-addr A] [--local-addr A] [--token T] [--noise] [--noise-key K] [--type tcp|udp] [-c] [--name N] [--json] [--yes]` — 一等、可重复的转发服务创建命令。client SPEC 使用 `name`、`local`、`token`、`type`；每个 client 配置先用一次 `config set --client --remote-addr A` 设置全局控制通道地址。
+- `config remove <NAME> [-c | --name N] [--json] [--yes]` — 确认后移除服务。
 - `config list [-c] [--name N] [--json]` — 列出服务。
 - `config set <--client|--server> [global fields] [-c] [--name N] [--json]` — 设置全局字段：`--remote-addr`、`--bind-addr`、`--default-token`、`--prefer-ipv6`、`--heartbeat-timeout`、`--retry-interval`、`--heartbeat-interval`、`--transport tcp|tls|noise|websocket`、`--noise`、`--noise-key`、`--trusted-root`、`--hostname`、`--pkcs12`、`--pkcs12-password`、`--ws-tls`、`--nodelay`、`--keepalive-secs`、`--keepalive-interval`、`--proxy`。
 - `status [-c] [--name N] [--json]` — 打印服务状态与配置树；无参数列出全部服务，`--name N` 查看单服务，`--json` 供脚本使用。

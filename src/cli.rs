@@ -45,7 +45,7 @@ pub fn major_version() -> u32 {
 
     long_version(LONG_VERSION.as_str()),
     after_help = "GitHub: https://github.com/rede97/rathole-x",
-    setting(AppSettings::DeriveDisplayOrder),
+    global_setting(AppSettings::DeriveDisplayOrder),
 )]
 pub struct Cli {
     #[clap(subcommand)]
@@ -87,7 +87,7 @@ pub enum Commands {
     /// Show the service state and the configuration as a tree
     Status(StatusArgs),
 
-    /// Start, stop or restart an installed service
+    /// Install, uninstall, start, stop or restart an installed service
     Service {
         #[clap(subcommand)]
         cmd: ServiceCmd,
@@ -112,7 +112,6 @@ pub enum ConfigCmd {
     /// Update global fields of the [client] or [server] section
     Set(Box<SetArgs>),
 }
-
 
 #[derive(Args, Debug, Clone, Default)]
 pub struct ListArgs {
@@ -177,12 +176,11 @@ pub struct AddArgs {
     /// Client service entries in compact form, repeatable.
     ///
     /// SPEC = "key:value;key:value;..." with keys:
-    ///   name (required), server (control channel host:port), local
-    ///   (local forward target, required), token (auto-generated when
-    ///   omitted), type (tcp|udp, default tcp).
-    /// The server key sets [client] remote_addr when the section is created;
-    /// when the section already exists it must match — one client config
-    /// connects to one server (use separate service instances for several).
+    ///   name (required), local (local forward target, required),
+    ///   token (auto-generated when omitted), type (tcp|udp, default tcp).
+    /// The control channel server is NOT part of a SPEC: one client config
+    /// connects to exactly one server, set once per config with
+    /// `config set --client --remote-addr <host:port>`.
     #[clap(long = "client", value_name = "SPEC", multiple_occurrences(true))]
     pub client_specs: Vec<String>,
 
@@ -192,12 +190,6 @@ pub struct AddArgs {
     /// token (auto-generated when omitted), type (tcp|udp, default tcp).
     #[clap(long = "server", value_name = "SPEC", multiple_occurrences(true))]
     pub server_specs: Vec<String>,
-
-    /// Client control channel address (host:port)
-    ///
-    /// Also sets [client] remote_addr when the section is created
-    #[clap(long)]
-    pub remote_addr: Option<String>,
 
     /// Server-side service bind address (host:port)
     ///
@@ -231,7 +223,7 @@ pub struct AddArgs {
     pub service_type: ServiceTypeArg,
 
     /// The path to the configuration file
-    #[clap(parse(from_os_str), short, long)]
+    #[clap(parse(from_os_str), short, long, conflicts_with = "name")]
     pub config: Option<PathBuf>,
 
     /// Short name of the installed service the operation targets. When
@@ -253,7 +245,7 @@ pub struct RemoveArgs {
     pub entry: String,
 
     /// The path to the configuration file
-    #[clap(parse(from_os_str), short, long)]
+    #[clap(parse(from_os_str), short, long, conflicts_with = "name")]
     pub config: Option<PathBuf>,
 
     /// Short name of the installed service the operation targets. When
@@ -264,14 +256,17 @@ pub struct RemoveArgs {
     /// Print the result as a single JSON object
     #[clap(long)]
     pub json: bool,
+
+    /// Skip the confirmation prompt before removing the service
+    #[clap(long)]
+    pub yes: bool,
 }
 
 #[derive(Args, Debug, Clone, Default)]
 pub struct InstallArgs {
     /// The role of the service: server or client (exactly one)
-    #[clap(arg_enum, value_name = "ROLE")]
+    #[clap(arg_enum, value_name = "ROLE", required = true)]
     pub role: Option<RoleArg>,
-
     /// The path to the configuration file the service runs with
     ///
     /// Defaults to the OS default directory
@@ -301,7 +296,7 @@ pub struct InstallArgs {
     /// Skip the confirmation prompt
     ///
     /// Without --yes an interactive terminal shows the install plan and asks
-    /// for confirmation; a non-interactive shell prints the usage and stops.
+    /// for confirmation; an unattended invocation fails with an actionable error.
     #[clap(long)]
     pub yes: bool,
 }
@@ -330,25 +325,25 @@ pub struct StatusArgs {
 pub struct UninstallArgs {
     /// Short name of the service to remove. When omitted and exactly one
     /// service is installed, that one is used.
-    #[clap(long)]
+    #[clap(long, conflicts_with = "all")]
     pub name: Option<String>,
 
     /// The path to the configuration file the service runs with
     ///
     /// Used for cleanup: version.toml is removed when the last service goes,
     /// the config file only with --purge.
-    #[clap(parse(from_os_str), short, long)]
+    #[clap(parse(from_os_str), short, long, conflicts_with = "all")]
     pub config: Option<PathBuf>,
 
     /// Also delete the configuration file
     ///
     /// Without --purge the network config is kept; version.toml is removed
     /// with the last service either way.
-    #[clap(long)]
+    #[clap(long, conflicts_with = "all")]
     pub purge: bool,
 
     /// Remove EVERY installed service, their configs and the shared binary
-    #[clap(long)]
+    #[clap(long, conflicts_with_all = &["name", "config", "purge"])]
     pub all: bool,
 
     /// Print the result as a single JSON object
@@ -358,7 +353,7 @@ pub struct UninstallArgs {
     /// Skip the confirmation prompt
     ///
     /// Without --yes an interactive terminal shows the removal plan and asks
-    /// for confirmation; a non-interactive shell prints the usage and stops.
+    /// for confirmation; an unattended invocation fails with an actionable error.
     #[clap(long)]
     pub yes: bool,
 }
@@ -384,11 +379,13 @@ impl TransportTypeArg {
 
 #[derive(Args, Debug, Clone, Default)]
 pub struct SetArgs {
-    /// Update the [client] section
+    /// Update the [client] section (optional when the config already
+    /// declares exactly one role — the side is then inferred)
     #[clap(long, group = "side")]
     pub client: bool,
 
-    /// Update the [server] section
+    /// Update the [server] section (optional when the config already
+    /// declares exactly one role — the side is then inferred)
     #[clap(long, group = "side")]
     pub server: bool,
 
@@ -475,7 +472,7 @@ pub struct SetArgs {
     pub proxy: Option<String>,
 
     /// The path to the configuration file
-    #[clap(parse(from_os_str), short, long)]
+    #[clap(parse(from_os_str), short, long, conflicts_with = "name")]
     pub config: Option<PathBuf>,
 
     /// Short name of the installed service the operation targets. When
@@ -515,11 +512,11 @@ pub enum ServiceCmd {
 pub struct ServiceArgs {
     /// Short name of the service. When omitted and exactly one service is
     /// installed, that one is used.
-    #[clap(long)]
+    #[clap(long, conflicts_with = "all")]
     pub name: Option<String>,
 
     /// Apply to every installed service
-    #[clap(long)]
+    #[clap(long, conflicts_with = "name")]
     pub all: bool,
 
     /// Print the result as a single JSON object
@@ -536,7 +533,7 @@ pub struct UpgradeArgs {
     /// Skip the confirmation prompt
     ///
     /// Without --yes an interactive terminal asks for confirmation;
-    /// a non-interactive shell prints the usage and stops.
+    /// an unattended invocation fails with an actionable error.
     #[clap(long)]
     pub yes: bool,
 }
@@ -561,18 +558,30 @@ mod tests {
     #[test]
     fn add_entry_conflicts_with_spec_flags() {
         assert!(parse(&[
-            "rathole-x", "config", "add", "mysvc", "--client",
+            "rathole-x",
+            "config",
+            "add",
+            "mysvc",
+            "--client",
             "name:a;server:127.0.0.1:2333;local:127.0.0.1:8080",
         ])
         .is_err());
         assert!(parse(&[
-            "rathole-x", "config", "add", "mysvc", "--server", "name:a;bind:0.0.0.0:8080",
+            "rathole-x",
+            "config",
+            "add",
+            "mysvc",
+            "--server",
+            "name:a;bind:0.0.0.0:8080",
         ])
         .is_err());
         // Each form alone still parses.
         assert!(parse(&["rathole-x", "config", "add", "mysvc", "--yes"]).is_ok());
         assert!(parse(&[
-            "rathole-x", "config", "add", "--client",
+            "rathole-x",
+            "config",
+            "add",
+            "--client",
             "name:a;server:127.0.0.1:2333;local:127.0.0.1:8080",
         ])
         .is_ok());
@@ -581,24 +590,50 @@ mod tests {
     #[test]
     fn add_bind_addr_conflicts_with_local_addr() {
         assert!(parse(&[
-            "rathole-x", "config", "add", "mysvc", "--yes", "--bind-addr", "0.0.0.0:8080",
-            "--local-addr", "127.0.0.1:8080",
+            "rathole-x",
+            "config",
+            "add",
+            "mysvc",
+            "--yes",
+            "--bind-addr",
+            "0.0.0.0:8080",
+            "--local-addr",
+            "127.0.0.1:8080",
         ])
         .is_err());
         assert!(parse(&[
-            "rathole-x", "config", "add", "mysvc", "--yes", "--bind-addr", "0.0.0.0:8080",
+            "rathole-x",
+            "config",
+            "add",
+            "mysvc",
+            "--yes",
+            "--bind-addr",
+            "0.0.0.0:8080",
         ])
         .is_ok());
     }
 
     #[test]
     fn add_noise_key_requires_noise() {
-        assert!(
-            parse(&["rathole-x", "config", "add", "mysvc", "--yes", "--noise-key", "abc"])
-                .is_err()
-        );
         assert!(parse(&[
-            "rathole-x", "config", "add", "mysvc", "--yes", "--noise", "--noise-key", "abc",
+            "rathole-x",
+            "config",
+            "add",
+            "mysvc",
+            "--yes",
+            "--noise-key",
+            "abc"
+        ])
+        .is_err());
+        assert!(parse(&[
+            "rathole-x",
+            "config",
+            "add",
+            "mysvc",
+            "--yes",
+            "--noise",
+            "--noise-key",
+            "abc",
         ])
         .is_ok());
     }
@@ -624,12 +659,19 @@ mod tests {
 
         // Explicit values keep working in both spellings.
         let s = set_args(
-            parse(&["rathole-x", "config", "set", "--client", "--nodelay", "false"]).unwrap(),
+            parse(&[
+                "rathole-x",
+                "config",
+                "set",
+                "--client",
+                "--nodelay",
+                "false",
+            ])
+            .unwrap(),
         );
         assert_eq!(s.nodelay, Some(false));
-        let s = set_args(
-            parse(&["rathole-x", "config", "set", "--client", "--ws-tls=false"]).unwrap(),
-        );
+        let s =
+            set_args(parse(&["rathole-x", "config", "set", "--client", "--ws-tls=false"]).unwrap());
         assert_eq!(s.ws_tls, Some(false));
 
         // Unset stays None.
@@ -642,8 +684,86 @@ mod tests {
         assert!(parse(&["rathole-x", "service", "start", "--json"]).is_ok());
         assert!(parse(&["rathole-x", "service", "stop", "--all", "--json"]).is_ok());
         assert!(parse(&["rathole-x", "service", "restart", "--json"]).is_ok());
-        assert!(parse(&["rathole-x", "service", "install", "server", "--yes", "--json"]).is_ok());
+        assert!(parse(&[
+            "rathole-x",
+            "service",
+            "install",
+            "server",
+            "--yes",
+            "--json"
+        ])
+        .is_ok());
         assert!(parse(&["rathole-x", "service", "uninstall", "--yes", "--json"]).is_ok());
         assert!(parse(&["rathole-x", "upgrade", "--yes", "--json"]).is_ok());
+    }
+    #[test]
+    fn service_target_conflicts_and_install_role_are_parse_errors() {
+        assert!(parse(&["rathole-x", "service", "install", "--yes"]).is_err());
+        assert!(parse(&["rathole-x", "service", "start", "--all", "--name", "svc"]).is_err());
+        assert!(parse(&[
+            "rathole-x",
+            "service",
+            "uninstall",
+            "--all",
+            "--name",
+            "svc",
+            "--yes",
+        ])
+        .is_err());
+        assert!(parse(&[
+            "rathole-x",
+            "service",
+            "uninstall",
+            "--all",
+            "--config",
+            "svc.toml",
+            "--yes",
+        ])
+        .is_err());
+        assert!(parse(&[
+            "rathole-x",
+            "service",
+            "uninstall",
+            "--all",
+            "--purge",
+            "--yes",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn config_edit_config_and_name_conflict() {
+        assert!(parse(&[
+            "rathole-x",
+            "config",
+            "set",
+            "--client",
+            "--remote-addr",
+            "host:2333",
+            "--config",
+            "client.toml",
+            "--name",
+            "client",
+        ])
+        .is_err());
+        assert!(parse(&[
+            "rathole-x",
+            "config",
+            "remove",
+            "svc",
+            "--config",
+            "client.toml",
+            "--name",
+            "client",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn help_flag_follows_user_options() {
+        let help = parse(&["rathole-x", "service", "install", "--help"])
+            .unwrap_err()
+            .to_string();
+        assert!(help.find("--yes").unwrap() < help.find("-h, --help").unwrap());
     }
 }

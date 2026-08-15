@@ -9,7 +9,8 @@ Fork positioning (must stay true):
 - **Wire protocol 100% upstream-compatible** (`src/protocol.rs` is byte-frozen; never change message shapes).
 - Subcommand-driven CLI (`rathole-x` binary) with interactive + agent-friendly (`--json`, `--yes`) modes.
 - Zero handcrafted config files: `service install` + `config add/set` manage everything; hot reload applies changes without restart.
-- One process can run BOTH server and client (dual mode) when the config has both sections — daemon `run` only; installed services are strictly single-role (one service per role, install two to run both).
+- Every foreground or installed process is single-role. A dual-section config requires explicit `run --server` or `run --client`; run separate independently configured processes for both roles.
+- JSON contract: each `--json` command writes one stdout envelope (`{ok:true,result}` or `{ok:false,error:{message}}`); confirmations in JSON/unattended execution require `--yes` and fail nonzero otherwise.
 - Windows: SCM service + UAC elevation + ACL-probed config permission model with a `version.toml` version stamp (no separate policy file). Linux systemd: planned only (`docs/plan-linux-service.md`).
 - Upstream boundaries in `docs/out-of-scope.md` still apply (no HTTP domain forwarding, no app-layer logging, etc.).
 
@@ -20,13 +21,11 @@ main.rs (parse Cli, stdio redirect for UAC relay, tracing init)
   └─ lib.rs::run → dispatch_command
        ├─ run → run_with_config
        │    ├─ ConfigWatcherHandle (notify): watches config file, diffs, emits ConfigChange
-       │    └─ run_instance per ConfigChange::General
-       │         ├─ RunMode::Client → run_client
        │         ├─ RunMode::Server → run_server
-       │         └─ RunMode::Both   → both halves via tokio::try_join!, one mpsc channel each,
-       │                              service events fanned out to every half
+       │         ├─ RunMode::Client → run_client
+       │         └─ RunMode::Ambiguous → require explicit role selection
        ├─ config {add|remove|list|set} → config_edit (toml_edit, atomic write) → file event → hot reload
-       ├─ status → tree renderer + SCM query
+       ├─ status → tree/JSON renderer + SCM query + local runtime snapshot query
        └─ service {install|uninstall|start|stop|restart|run} → platform::install_service/uninstall_service/control_service/run_service (UAC relay + SCM)
 ```
 
@@ -80,13 +79,13 @@ cargo check --target x86_64-unknown-linux-gnu --no-default-features --features e
 | File | Why it matters |
 |---|---|
 | `src/protocol.rs` | Wire format — never change; `CURRENT_PROTO_VERSION`, bincode fixed-size reads |
-| `src/lib.rs` | Dispatch, dual-mode fan-out, `determine_run_mode`, `os_default_config_path` |
+| `src/lib.rs` | Dispatch, JSON envelopes, single-role `determine_run_mode`, `os_default_config_path` |
 | `src/cli.rs` | Entire CLI surface incl. hidden `--elevated-log` (global, required by UAC relay) |
-| `src/config.rs` | Schema; defaults live here (`default_heartbeat_timeout` etc.) |
 | `src/config_watcher.rs` | Hot reload diffing; rescan-failure semantics |
 | `src/config_edit.rs` | All config write paths; version.toml policy; skeletons |
-| `src/platform/windows.rs` | SCM install/uninstall, UAC relay (`relaunch_elevated_wait` + `--elevated-log` replay), ACL grants, binary self-copy, per-service `uninstall-<N>.bat` |
-| `src/status.rs` | Status tree + `--json` shape |
+| `src/platform/windows.rs` | SCM install/uninstall, UAC relay (`relaunch_elevated_wait` + `--elevated-log` replay), ACL grants, binary self-copy, per-service `uninstall-<N>.bat`, local status pipe |
+| `src/runtime_status.rs` | Versioned local runtime snapshot registry, transitions, deterministic endpoint naming |
+| `src/status.rs` | Status tree/JSON merge for SCM, config, and runtime snapshots |
 | `build.rs` | vergen WITHOUT git feature (native libgit2 breaks MSVC; `VERGEN_GIT_*` don't exist) |
 | `examples/tls/` | TLS test material; certs expire (~1y) — regenerate with `sh create_self_signed_cert.sh` under `MSYS_NO_PATHCONV=1` |
 | `docs/plan-linux-service.md` | Authoritative Linux systemd plan (Chinese, frozen) |

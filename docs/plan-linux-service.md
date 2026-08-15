@@ -22,7 +22,10 @@ sudo rathole-x service uninstall [--name <N>]
   - 不可写（默认）：CLI 须提权（Windows 走 UAC `relaunch_elevated_wait`；Linux 对应 sudo）后覆盖配置，服务热加载。
   - CLI 侧判定逻辑在 `config_edit::writable_by_current_user`（打开探测/目录探测）+ `platform` 提权流程。
 - 版本契约：多服务模型：`service install server|client --name <N>` 每服务一个配置文件（`/etc/rathole-x/<N>.toml`），服务名 `rathole-x-<role>-<N>`；`version.toml` 由 `service install` 写入 `version = <大版本>`；`config add/set/remove` 在大版本不匹配时拒绝执行（`config_edit::check_version_compat`），修复方式是重装服务；只读命令与 `service install/uninstall` 不受限。**开发规则：任何破坏性配置 schema 变更（改/删字段、改语义或默认值）必须升大版本**；纯新增可选字段（带 serde default）不要求。版本戳放 version.toml 而非主配置，保证主配置文件仍可被上游 rathole 解析。
-- 已实现的原则沿用：daemon 单进程可同时承载 [server] 与 [client] 双模式(lib.rs `RunMode::Both`)，仅限 `run` 前台运行；已安装服务严格单角色（一服务一角色，双角色需求安装两个服务）。
+- 已实现的原则沿用：每个 daemon 或已安装服务进程只承载一个角色。配置同时含 `[server]` 和 `[client]` 时，前台 `run` 必须明确使用 `--server` 或 `--client`；双角色需求使用两个独立配置和进程。
+
+- 自动化契约：`config add/remove/list/set`、`status`、服务生命周期与 `upgrade` 的 `--json` stdout 严格输出一个 `{ok,result}` 或 `{ok:false,error:{message}}` 封套；确认型操作在无人值守或 JSON 情况必须使用 `--yes`，否则非零失败，绝不打印用法后成功退出。
+- 运行时状态端点：Windows 当前以规范化配置路径派生的 ACL 本地命名管道提供只读快照；Linux 实现时为每个 unit 提供等价的本地、访问受控端点（不得增加 daemon 网络监听），使 `status` 的 `runtime` 字段一致。端点缺失必须表示 `runtime: null` 与可操作原因，而非让 SCM/配置状态查询失败。
 
 ## 文件布局
 

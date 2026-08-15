@@ -23,7 +23,7 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 
 - **One binary, subcommand-driven CLI.** Human-friendly: interactive prompts plus auto-generated tokens and noise keys. Agent-friendly: everything is available as flags, with `--json` output and a `--yes` non-interactive mode.
 - **Zero config-file handcrafting.** `service install <server|client>` deploys a system service with a role-specific skeleton config; `config add`/`config set` manage everything; hot reload applies changes without restarting.
-- **One service, one role.** Each installed service runs exactly one role (server or client) with its own config file; to run both on a host, install two services — each stays independently installable, upgradable and observable (Unix philosophy). The foreground daemon (`run`) still runs both sections of a single config in one process.
+- **One process, one role.** Every foreground or installed process runs exactly one role (server or client) from one role-specific config. To run both on a host, configure and run two independent processes.
 - **Upstream-compatible wire protocol.** `rathole-x` speaks the same wire protocol as upstream rathole, so the two interoperate.
 - **Platform integration.** Windows SCM service plus UAC elevation; Linux systemd is planned (see [docs/plan-linux-service.md](docs/plan-linux-service.md)).
 - **Secure defaults.** Tokens are mandatory; config edits are gated by the actual file permissions — the CLI probes whether the current user can write the config and elevates (UAC) only when not; the service binary is copied into `ProgramData` and is not replaceable by non-admins.
@@ -31,7 +31,7 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 ## New features over upstream
 
 - **Subcommand-driven CLI** — `run` (run the daemon), `config add|remove|list|set` (manage the service configuration), `status` (service state + config tree), `genkey` (generate a noise keypair), `service install|uninstall|start|stop|restart` (system service lifecycle), `upgrade` (update the installed binary). See [CLI reference](#cli-reference) for flags.
-- **Dual mode (daemon only)** — `run` executes both server and client in one process when the config has both sections; installed services are strictly single-role, so running both roles means installing two services.
+- **Single-role execution** — a config containing both sections must be run explicitly with `run --server` or `run --client`; normal deployment uses two independently configured processes.
 - **Auto-generated tokens and noise keys** — `config add`/`config set` generate them when omitted.
 - **Hot reload via atomic writes** — `config add`/`config set`/`config remove` rewrite the config atomically; the running service hot-reloads it without a restart.
 - **Windows service install** — `service install server|client --name <n>` registers a named SCM service (AutoStart) with its own config file; the binary is copied next to the configs and is not replaceable by non-admins; an `uninstall-<n>.bat` is written per service; whether non-admin users may edit a config is decided by its actual permissions (no policy file).
@@ -40,7 +40,7 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 
 ## Quick start (Windows)
 
-1. Install the services from an elevated shell — one named service per role; to run both server and client on a host, install two services. You will be asked to confirm (or pass `--yes` to skip; non-interactive shells get the usage unless `--yes` is passed). A role skeleton config is created if missing, the binary is copied next to the configs, and a Windows SCM service (AutoStart) is registered with UAC elevation:
+1. Install the services from an elevated shell — one named process per role; to run both server and client on a host, install two services. You will be asked to confirm (or pass `--yes` to skip; unattended and JSON invocations fail with an actionable error unless `--yes` is passed). A role skeleton config is created if missing, the binary is copied next to the configs, and a Windows SCM service (AutoStart) is registered with UAC elevation:
 
 ```bash
 # Server (public IP)
@@ -56,8 +56,10 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 # Server (public IP): expose port 5202 to the Internet
 ./rathole-x config add --name relay --server "name:my_nas_ssh;bind:0.0.0.0:5202"
 
-# Client (behind NAT): forward to the NAS ssh daemon on port 22
-./rathole-x config add --name home-nas --client "server:myserver.com:2333;name:my_nas_ssh;local:127.0.0.1:22"
+# Client (behind NAT): point at the server once, then forward to the NAS
+# ssh daemon on port 22
+./rathole-x config set --name home-nas --client --remote-addr myserver.com:2333
+./rathole-x config add --name home-nas --client "name:my_nas_ssh;local:127.0.0.1:22"
 ```
 
 3. Check the service state and the configuration tree:
@@ -95,13 +97,19 @@ Read-only commands (`status`, `list`, `run`) and `install`/`uninstall` are never
 
 **Rule for developers: any breaking config schema change (renamed/removed/retagged fields, changed semantics or defaults) MUST bump the major version.** Purely additive changes (new optional fields with serde defaults) do not require one. The stamp lives in `version.toml`, so the rathole config file itself stays 100% parseable by upstream rathole.
 
+## Runtime connection status
+
+On Windows, `status` also queries an ACL-protected local named pipe derived from the canonical config path. The `runtime` field is a local snapshot, not a network probe: it includes schema version, role, process ID and capture time; client services report `connecting`, `connected`, `retrying`, or `stopped` plus configured/resolved **control target** and connection/error times; server services report `waiting`, `connected`, or `stopped` plus the authenticated control-channel source and connection/disconnect metadata. It never exposes tokens, keys, payloads, or traffic.
+
+`runtime: null` is normal when the process is stopped, uses an old binary or another config, or has not created its endpoint yet; `runtime_availability.reason` explains it without failing the static status result. Linux/systemd endpoint support is planned.
+
 ## CLI reference
 
-`config add|remove|list|set` and `status` accept `--json` for machine-readable output; `service install`, `service uninstall` and `upgrade` confirm before running — a TTY shows an interactive prompt, `--yes` (or `RATHOLE_X_CONFIRMED=1`) skips it, and a non-interactive shell without `--yes` only prints the usage. The upstream positional `./rathole config.toml` form is **not supported** in this fork — run the daemon with `run -c CONFIG` (with no `-c`, the OS default path is used: Windows `%ProgramData%\rathole-x\rathole-x.toml`, Linux `/etc/rathole-x.toml`). Commands with `--name` target the installed service of that name; when both `--name` and `-c` are omitted and exactly one service is installed, that one is used.
+`config add|remove|list|set`, `status`, service lifecycle actions, and `upgrade` accept `--json`. JSON stdout is exactly one envelope: `{ "ok": true, "result": ... }` or `{ "ok": false, "error": { "message": ... } }`; progress and diagnostics stay off stdout. `config remove`, service install/uninstall, and upgrade require confirmation: use `--yes` for JSON or unattended invocation, otherwise they fail with an actionable error. The upstream positional `./rathole config.toml` form is **not supported** in this fork — run the daemon with `run -c CONFIG` (with no `-c`, the OS default path is used: Windows `%ProgramData%\rathole-x\rathole-x.toml`, Linux `/etc/rathole-x.toml`).
 
-- `run [-c CONFIG] [--server|--client]` — run the daemon; `--server`/`--client` force a mode. A dual-section config runs both halves in one process.
-- `config add [<NAME>] [--client SPEC]... [--server SPEC]... [--remote-addr A] [--bind-addr A] [--local-addr A] [--token T] [--noise] [--noise-key K] [--type tcp|udp] [-c] [--name N] [--json] [--yes]` — add services by name and flags, or in batches via repeatable `--client "server:...;name:...;local:...;token:...;type:..."` / `--server "name:...;bind:...;token:...;type:..."` specs (one write, one hot-reload). Without a name in a TTY it runs a multi-round interactive wizard (empty name finishes). One client config connects to exactly one server (upstream model): the spec's `server:` key sets the `[client] remote_addr` default on a fresh section, and must match it when the section already exists — to use another server, install a separate service instance (`service install client --name <N>`).
-- `config remove <NAME> [-c] [--name N] [--json]` — remove a service.
+- `run [-c CONFIG] [--server|--client]` — run exactly one daemon role. A dual-section config requires explicit `--server` or `--client`.
+- `config add [<NAME>] [--client SPEC]... [--server SPEC]... [--bind-addr A] [--local-addr A] [--token T] [--noise] [--noise-key K] [--type tcp|udp] [-c] [--name N] [--json] [--yes]` — first-class repeatable forwarding-service creation. Client specs use `name`, `local`, `token`, and `type`; set the one config-global remote first with `config set --client --remote-addr A`. Batch specs make one atomic write; interactive add accepts corrected field input.
+- `config remove <NAME> [-c | --name N] [--json] [--yes]` — remove a service after confirmation.
 - `config list [-c] [--name N] [--json]` — list services.
 - `config set <--client|--server> [global fields] [-c] [--name N] [--json]` — set global fields: `--remote-addr`, `--bind-addr`, `--default-token`, `--prefer-ipv6`, `--heartbeat-timeout`, `--retry-interval`, `--heartbeat-interval`, `--transport tcp|tls|noise|websocket`, `--noise`, `--noise-key`, `--trusted-root`, `--hostname`, `--pkcs12`, `--pkcs12-password`, `--ws-tls`, `--nodelay`, `--keepalive-secs`, `--keepalive-interval`, `--proxy`.
 - `status [-c] [--name N] [--json]` — print the service state plus the config tree; without `--name` every installed service is listed.
@@ -144,8 +152,11 @@ Read-only commands (`status`, `list`, `run`) and `install`/`uninstall` are never
 The `rathole-x` binary is fully subcommand-based; running it bare prints the help. Start the daemon with `run -c` (the upstream positional `./rathole config.toml` form is not supported in this fork).
 
 ```bash
-# Add a service by name; tokens are auto-generated when omitted.
-./rathole-x config add --client "server:myserver.com:2333;name:my_nas_ssh;local:127.0.0.1:22"
+# Add forwarding services repeatedly; set the client control-channel server
+# once per client config before its first add.
+./rathole-x config set --client --remote-addr myserver.com:2333
+./rathole-x config add --client "name:my_nas_ssh;local:127.0.0.1:22"
+./rathole-x config add --client "name:database;local:127.0.0.1:5432"
 
 # Tune [client]/[server] global fields and transports without editing the file
 ./rathole-x config set --server --bind-addr 0.0.0.0:2333 --noise            # generates a noise keypair
@@ -161,19 +172,21 @@ The `rathole-x` binary is fully subcommand-based; running it bare prints the hel
 ./rathole-x config list -c config.toml
 ./rathole-x config remove my_nas_ssh -c config.toml
 
-# Interactive prompts are used when flags are missing and a TTY is present;
-# scripts can pass every flag and read machine-readable output with --json.
-./rathole-x config add --client "server:myserver.com:2333;name:my_nas_ssh;local:127.0.0.1:22" --json
+# --json writes exactly one envelope to stdout:
+# {"ok":true,"result":...} or {"ok":false,"error":{"message":"..."}}.
+# Confirmation-required actions need --yes in JSON/unattended use.
+./rathole-x config add --client "name:my_nas_ssh;local:127.0.0.1:22" --json
 
-# Batch-add several services for the same server in one write
-./rathole-x config add --client "server:srv-a.com:2333;name:nas;local:127.0.0.1:22" \
-  --client "server:srv-a.com:2333;name:db;local:127.0.0.1:5432"
+# Batch-add several services in one write; add remains repeatable for later ports.
+./rathole-x config add --client "name:nas;local:127.0.0.1:22" \
+  --client "name:db;local:127.0.0.1:5432"
 
 # Generate a noise keypair (replaces the removed --genkey flag)
 ./rathole-x genkey
 
-# Run one process that serves both [server] and [client] sections at once
-./rathole-x run -c config.toml
+# A run process selects exactly one role. A hand-written dual-section config
+# requires --server or --client; production services remain separate.
+./rathole-x run --server -c server.toml
 # Install named services: exactly one role per service, one config file per
 # service. A role-specific skeleton config is created automatically.
 ./rathole-x service install server --yes --name relay
