@@ -327,29 +327,6 @@ fn lockdown_icacls_args(
     let admins_full = OsString::from("*S-1-5-32-544:F");
     let mut cmds: Vec<Vec<OsString>> = Vec::new();
 
-    let admins_group = OsString::from("*S-1-5-32-544");
-    let mut lock = |path: &Path, grants: &[&OsStr]| {
-        // Ownership first: without this the original owner can rewrite the
-        // DACL we are about to install (implicit WRITE_DAC of an owner) and
-        // regain control of the directory — including delete/replace rights
-        // over the service binary.
-        cmds.push(vec![
-            path.as_os_str().to_os_string(),
-            OsString::from("/setowner"),
-            admins_group.clone(),
-        ]);
-        cmds.push(vec![path.as_os_str().to_os_string(), OsString::from("/reset")]);
-        let mut cmd = vec![
-            path.as_os_str().to_os_string(),
-            OsString::from("/inheritance:r"),
-        ];
-        for grant in grants {
-            cmd.push(OsString::from("/grant"));
-            cmd.push(grant.to_os_string());
-        }
-        cmds.push(cmd);
-    };
-
     let system_full = OsString::from("*S-1-5-18:F");
     let system_read = OsString::from("*S-1-5-18:R");
     let users_create = OsString::from("*S-1-5-32-545:WD");
@@ -359,17 +336,115 @@ fn lockdown_icacls_args(
     if allow_user_config {
         dir_grants.push(&users_create);
     }
-    lock(dir, &dir_grants);
+    cmds.extend(path_lockdown_args(dir, &dir_grants));
 
-    lock(exe, &[&admins_full, &system_full]);
+    cmds.extend(exe_lockdown_args(exe));
 
     let mut config_grants: Vec<&OsStr> = vec![&admins_full, &system_read];
     if allow_user_config {
         config_grants.push(&users_modify);
     }
-    lock(config, &config_grants);
+    cmds.extend(path_lockdown_args(config, &config_grants));
 
     cmds
+}
+
+/// The three icacls invocations that lock one path down: take ownership
+/// (the pre-creation owner implicitly holds WRITE_DAC and could otherwise
+/// silently undo the grants), drop every existing ACE, then grant exactly
+/// `grants`.
+fn path_lockdown_args(path: &Path, grants: &[&OsStr]) -> Vec<Vec<OsString>> {
+    let mut cmds = vec![vec![
+        path.as_os_str().to_os_string(),
+        OsString::from("/setowner"),
+        OsString::from("*S-1-5-32-544"),
+    ]];
+    cmds.push(vec![path.as_os_str().to_os_string(), OsString::from("/reset")]);
+    let mut cmd = vec![
+        path.as_os_str().to_os_string(),
+        OsString::from("/inheritance:r"),
+    ];
+    for grant in grants {
+        cmd.push(OsString::from("/grant"));
+        cmd.push(grant.to_os_string());
+    }
+    cmds.push(cmd);
+    cmds
+}
+
+/// The binary lockdown, shared by `install` (via `lockdown_icacls_args`)
+/// and `upgrade` (re-applied after the binary is replaced: the replacement
+/// inherits the temp file's security descriptor, which would leave a
+/// user-replaceable LocalSystem service binary behind).
+fn exe_lockdown_args(exe: &Path) -> Vec<Vec<OsString>> {
+    let admins = OsString::from("*S-1-5-32-544:F");
+    let system = OsString::from("*S-1-5-18:F");
+    path_lockdown_args(exe, &[&admins, &system])
+}
+
+/// Atomically replace `replaced` with `replacement` while KEEPING the
+/// security descriptor, owner and attributes of `replaced`.
+///
+/// `std::fs::rename` (MoveFileEx REPLACE_EXISTING) makes the new file
+/// inherit the *replacement's* security descriptor: a config written by an
+/// un-elevated CLI would lose the install-time ACL lockdown and hand
+/// ownership to the writing user (an NTFS owner implicitly holds
+/// WRITE_DAC). `ReplaceFileW` is the Windows API built for exactly this
+/// swap — only the content changes.
+///
+/// When `replaced` does not exist yet (first write) there is nothing to
+/// preserve and a plain rename is used. On any other failure the
+/// replacement file is removed (it may contain secrets) and the error is
+/// returned.
+pub fn replace_file_preserving_security(replacement: &Path, replaced: &Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
+    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+
+    fn wide(p: &Path) -> Vec<u16> {
+        p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    }
+    let replaced_w = wide(replaced);
+    let replacement_w = wide(replacement);
+    // No library calls between ReplaceFileW and GetLastError — they would
+    // clobber the thread's last error.
+    let ok = unsafe {
+        ReplaceFileW(
+            replaced_w.as_ptr(),
+            replacement_w.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    let err = unsafe { GetLastError() };
+    if ok != 0 {
+        return Ok(());
+    }
+    if err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND {
+        // First write: no security descriptor to preserve.
+        if let Err(e) = std::fs::rename(replacement, replaced) {
+            let _ = std::fs::remove_file(replacement);
+            return Err(anyhow!(e)).with_context(|| {
+                format!(
+                    "failed to create {} from {}",
+                    replaced.display(),
+                    replacement.display()
+                )
+            });
+        }
+        return Ok(());
+    }
+    // On failure the replacement file is in an undefined state (it may
+    // already have been consumed); best-effort cleanup — never leave a
+    // secret-bearing temp file behind.
+    let _ = std::fs::remove_file(replacement);
+    bail!(
+        "failed to replace {} preserving its security descriptor (winerror {})",
+        replaced.display(),
+        err
+    );
 }
 
 /// Run one icacls invocation; failures are fatal: an install that cannot
@@ -528,11 +603,14 @@ fn ensure_binary_copy(source: &Path, dest: &Path) -> Result<()> {
         .unwrap_or_else(|| "rathole-x.exe".to_owned());
     let tmp = dest.with_file_name(format!("{}.tmp{}", file_name, std::process::id()));
     let copy_err = match std::fs::copy(source, &tmp) {
-        Ok(_) => match std::fs::rename(&tmp, dest) {
+        // ReplaceFileW keeps the destination's security descriptor and
+        // owner (a plain rename would let the temp file's descriptor win);
+        // `upgrade` re-applies the exe lockdown afterwards.
+        Ok(_) => match replace_file_preserving_security(&tmp, dest) {
             Ok(()) => return Ok(()),
             Err(e) => e,
         },
-        Err(e) => e,
+        Err(e) => anyhow!(e),
     };
     let _ = std::fs::remove_file(&tmp);
     Err(anyhow!(copy_err)).with_context(|| {
@@ -1271,7 +1349,17 @@ pub fn upgrade_binary() -> Result<()> {
         .file_name()
         .ok_or_else(|| anyhow!("current executable has no file name"))?;
     let installed = crate::config_edit::config_dir().join(exe_name);
-    if let Err(e) = ensure_binary_copy(&exe, &installed) {
+    let update_result = (|| -> Result<()> {
+        ensure_binary_copy(&exe, &installed)?;
+        // The replacement inherits the temp file's security descriptor;
+        // re-apply the binary lockdown so an upgrade can never leave a
+        // user-replaceable LocalSystem service binary behind.
+        for args in exe_lockdown_args(&installed) {
+            run_icacls(&args)?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = update_result {
         warn!("binary update failed: {:#}; restarting services best-effort", e);
         let restarted = start_services_best_effort(&manager, &services);
         warn!("restarted {} service(s) after the failed update", restarted);
@@ -1637,6 +1725,99 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    #[test]
+    fn replace_file_first_write_falls_back_to_rename() {
+        let dir = std::env::temp_dir().join("rathole-x-replace-first");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("cfg.toml");
+        let tmp = dir.join("cfg.toml.tmp1");
+        std::fs::write(&tmp, "v1").unwrap();
+
+        replace_file_preserving_security(&tmp, &target).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "v1");
+        assert!(!tmp.exists(), "first-write fallback consumes the temp file");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn replace_file_preserves_security_descriptor() {
+        // Audit lesson: string-level unit tests cannot validate external
+        // semantics. This test performs a REAL icacls lockdown, a REAL
+        // replacement and compares the ACL text before and after — exactly
+        // the semantics `write_atomic` depends on.
+        let dir = std::env::temp_dir().join("rathole-x-replace-acl");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("cfg.toml");
+        std::fs::write(&target, "v1").unwrap();
+
+        // Install-time lockdown shape for the config DACL under
+        // --allow-user-config: inheritance off, Administrators full,
+        // SYSTEM read, Users modify — the exact scenario the preserved
+        // descriptor must survive (an un-elevated user CLI writes the
+        // config; the watcher service keeps reading it as SYSTEM).
+        // (The /setowner step of the real lockdown is skipped: setting the
+        // owner to Administrators needs an elevated token; the preserved
+        // DACL is what makes this test's comparison meaningful.)
+        for args in [
+            vec!["/reset"],
+            vec![
+                "/inheritance:r",
+                "/grant",
+                "*S-1-5-32-544:F",
+                "/grant",
+                "*S-1-5-18:R",
+                "/grant",
+                "*S-1-5-32-545:M",
+            ],
+        ] {
+            let mut cmd = std::process::Command::new("icacls");
+            cmd.arg(&target);
+            for a in args {
+                cmd.arg(a);
+            }
+            let st = cmd.status().unwrap();
+            assert!(
+                st.success(),
+                "icacls {:?} failed with {} — this test requires a writable DACL on its own file",
+                target,
+                st
+            );
+        }
+
+        let acl_text = |p: &Path| -> String {
+            let out = std::process::Command::new("icacls")
+                .arg(p)
+                .output()
+                .expect("failed to run icacls");
+            assert!(out.status.success(), "icacls {:?} listing failed", p);
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let before = acl_text(&target);
+        assert!(
+            !before.contains("(I)"),
+            "lockdown must drop inherited ACEs so the comparison is meaningful"
+        );
+
+        // The swap a config write performs.
+        let tmp = dir.join("cfg.toml.tmp1");
+        std::fs::write(&tmp, "v2").unwrap();
+        replace_file_preserving_security(&tmp, &target).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "v2");
+        assert!(!tmp.exists());
+
+        // The security descriptor (DACL and owner) must be byte-identical
+        // to what the lockdown installed.
+        let after = acl_text(&target);
+        assert_eq!(
+            before, after,
+            "replacement must keep the target's security descriptor"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

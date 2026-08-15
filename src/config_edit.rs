@@ -376,11 +376,20 @@ pub fn ensure_role_config(path: &Path, role: ServiceRole) -> Result<bool> {
 /// Atomically replace `path`: write a unique temp file in the same
 /// directory, then rename it over the target. Prevents the config watcher
 /// from observing a partially written file.
+///
+/// On Windows the swap goes through `ReplaceFileW` so the target's
+/// security descriptor and owner survive the write — a plain rename would
+/// let the temp file's descriptor win, silently dropping the install-time
+/// ACL lockdown and handing ownership to the writing user.
 fn write_atomic(path: &Path, content: &str) -> Result<()> {
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     std::fs::write(&tmp, content)
         .with_context(|| format!("Failed to write {}", tmp.display()))?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    #[cfg(windows)]
+    let replace = crate::platform::replace_file_preserving_security(&tmp, path);
+    #[cfg(not(windows))]
+    let replace = std::fs::rename(&tmp, path);
+    if let Err(e) = replace {
         // Never leave a temp file with plaintext secrets behind
         let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| {
