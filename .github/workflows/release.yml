@@ -77,11 +77,18 @@ jobs:
         with:
           tool: cross
       - uses: Swatinem/rust-cache@v2
+      # Linux musl ships rustls-only: native-tls would need a target OpenSSL
+      # sysroot per architecture. The rustls feature set is the same one the
+      # Docker image and acceptance tests use.
       - name: Run native tests
         if: matrix.native_test
-        run: cross test --locked --release --target ${{ matrix.target }} --verbose
+        run: >
+          cross test --locked --release --target ${{ matrix.target }} --verbose
+          --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
       - name: Build release
-        run: cross build --locked --release --target ${{ matrix.target }}
+        run: >
+          cross build --locked --release --target ${{ matrix.target }}
+          --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
       - name: Package release
         run: >
           tar -czf rathole-x-${{ matrix.target }}.tar.gz

@@ -85,13 +85,19 @@ jobs:
         with:
           tool: cross
       - uses: Swatinem/rust-cache@v2
-      - name: Run native-tls tests
-        if: matrix.native_test
-        run: ${{ matrix.build }} test --locked --target ${{ matrix.target }} --verbose
+      # Linux musl builds are rustls-only: native-tls cannot find a target
+      # OpenSSL sysroot in cross containers. Windows legs keep default
+      # features (Schannel has no external dependency).
       - name: Run rustls tests
         if: matrix.native_test
         run: >
           ${{ matrix.build }} test --locked --target ${{ matrix.target }} --verbose
           --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
       - name: Compile target
-        run: ${{ matrix.build }} build --locked --target ${{ matrix.target }}
+        run: >
+          ${{ matrix.build }} build --locked --target ${{ matrix.target }}
+          ${{
+            matrix.build == 'cross'
+            && '--no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload'
+            || ''
+          }}
