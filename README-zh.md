@@ -33,8 +33,8 @@ rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://g
 - **单角色执行** — 同时含 `[server]` 与 `[client]` 的手写配置必须显式使用 `run --server` 或 `run --client`；常规部署使用两个独立配置的进程。
 - **自动生成 token 与 noise 密钥** — `config add`/`config set` 在省略时自动生成。
 - **原子写入热重载** — `config add`/`config set`/`config remove` 原子重写配置；运行中的服务无需重启即热重载。
-- **Windows 服务安装** — `service install server|client --name <n>` 注册一个命名 SCM 服务（AutoStart，SCM 名称为 `rathole-x-<role>-<N>`），拥有各自独立的配置文件；二进制被复制到配置旁，非管理员不可替换；每个服务写入一个 `uninstall-<n>.bat`；是否允许非管理员编辑配置由实际权限决定（无策略文件）。
-- **状态树视图** — `status` 打印服务状态 + 配置树（无参数列出全部服务，`--name N` 查看单服务，`--json` 供脚本使用）。
+- **Windows 服务安装** — `service install server|client --name <n>` 注册命名的 AutoStart SCM 服务，运行身份是 `NT AUTHORITY\LocalService`，带**受限的每服务 SID**，绝不使用 LocalSystem。共享受保护二进制仅向已安装的 `NT SERVICE\rathole-x-<role>-<n>` SID 授予读/执行；每个服务有独立受保护的日志目录；已安装配置对本地用户只读，因此只读 `status` 无需 UAC，默认仅 Administrators 可编辑（`--allow-user-config` 显式授予 Users 写权限）。
+- **Linux systemd / OpenRC 服务安装** — 同一 `service install server|client --name <n>` 会在运行时检测 init 系统：systemd 写入开机启用的受限非 root unit；OpenRC（Alpine、Gentoo）生成以 `command_args_foreground` 让守护进程作为 `rathole-x` 运行的 openrc-run 脚本，root 仅保留 supervisor/pid/log 生命周期职责。低端口只通过 `CAP_NET_BIND_SERVICE` 支持。
 - **角色骨架自动创建** — `service install` 在缺失时创建角色专属的骨架配置。
 
 ## Quick start (Windows)
@@ -73,26 +73,7 @@ rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://g
 ./rathole-x service uninstall --yes --name home-nas
 ```
 
-> **Linux systemd** 服务支持已规划 — 见 [docs/plan-linux-service.md](docs/plan-linux-service.md)。
-
-## Config schema versioning
-
-`version.toml` 文件（由 `service install` 写入）记录了安装该服务的 rathole-x 构建的**大版本号**。`config add`/`config set`/`config remove` 会拒绝操作其大版本戳与当前 CLI 不一致的配置：
-
-```
-This config is managed by rathole-x v0 but this CLI is v1.
-Reinstall the service to upgrade: `rathole-x service uninstall --yes` then `rathole-x service install <server|client> --yes`.
-```
-
-只读命令（`status`、`list`、`run`）以及 `install`/`uninstall` 永不被拦截。没有策略文件的配置（用户自行管理的文件）无版本戳、无限制。
-
-**开发者规则：任何破坏性的配置 schema 变更（重命名/删除/重新打标签的字段、语义或默认值变更）都必须升级大版本号。** 纯增量变更（带 serde 默认值的新可选字段）则无需升级。版本戳存放在 `version.toml` 中，因此 rathole 配置文件本身仍可被上游 rathole 100% 解析。
-
-## 运行时连接状态
-
-Windows 上，`status` 还会查询由规范化配置路径派生、受 ACL 保护的本地命名管道。`runtime` 是本机快照而非网络探测：包含 schema 版本、角色、进程 ID 与采集时间；client 服务包含 `connecting`、`connected`、`retrying` 或 `stopped`，以及已配置/已解析的**控制通道目标**和连接/错误时间；server 服务包含 `waiting`、`connected` 或 `stopped`，以及已认证控制通道的来源地址和连接/断开元数据。不会暴露 token、密钥、载荷或流量。
-
-进程已停止、仍是旧二进制、使用另一份配置或端点尚未就绪时，`runtime: null` 属于正常结果；`runtime_availability.reason` 给出原因而不会使静态状态查询失败。Linux/systemd 端点仍在计划中。
+> **Linux systemd / OpenRC**：同样的命令须以 `sudo` 运行（`sudo rathole-x service install server --yes --name relay`）。systemd 写入、启用并启动 `rathole-x-server-relay.service`；OpenRC（Alpine、Gentoo）写入 `/etc/init.d/rathole-x-server-relay`，并通过 `rc-update add default` 注册。两者都以专用、不可登录的 `rathole-x:rathole-x` 账号而不是 root 运行受保护的 root:root `0755` `/usr/local/lib/rathole-x/rathole-x`。低端口只通过 `CAP_NET_BIND_SERVICE` 支持；Linux 不做自提权，非 root 运行会报 `please run with sudo`。见 [docs/plan-linux-service.md](docs/plan-linux-service.md)。
 
 ## Service lifecycle
 
@@ -101,12 +82,45 @@ Windows 上，`status` 还会查询由规范化配置路径派生、受 ACL 保�
 - `rathole-x service uninstall --yes --all` — 移除所有已安装服务、全部配置与共享二进制。
 - 常规的 `service uninstall --yes` 会保留可被用户删除的配置；而卸载一个已移除的服务会在**不提权**的情况下清理残留文件。
 
+## Config schema versioning
+
+`version.toml` 文件（由 `service install` 写入）记录了安装该服务的 rathole-x 构建的**大版本号**。`config add`/`config set`/`config remove` 会拒绝操作其大版本戳与当前 CLI 不一致的配置：
+
+```text
+This config is managed by rathole-x v0 but this CLI is v1.
+Reinstall the service to upgrade: `rathole-x service uninstall --yes` then `rathole-x service install <server|client> --yes`.
+```
+
+只读命令（`status`、`config list`、`run`）以及 `install`/`uninstall` 不被版本戳拦截。没有版本戳的配置（用户自行管理的文件）无限制。
+
+**开发者规则：任何破坏性的配置 schema 变更（重命名/删除/重新打标签的字段、语义或默认值变更）都必须升级大版本号。** 纯增量变更（带 serde 默认值的新可选字段）则无需升级。版本戳存放在 `version.toml` 中，因此 rathole 配置文件本身仍可被上游 rathole 解析。
+
+## Docker
+
+在 Docker 宿主机上完全不需要 init 系统：Docker 本身就是生命周期管理器（`restart` = 崩溃重启，Docker 守护进程 = 开机自启，`docker stop` 发送 SIGTERM）。镜像**不会启动或调用 systemd/OpenRC**。入口点只做挂载配置目录所需的最小所有权初始化，随后以非 root 的 `rathole-x` 身份 `exec` 前台 `rathole-x run`；Docker 管理该进程，守护进程热加载挂载配置。
+
+```bash
+docker build -t rathole-x .
+docker run -d --name rathole-x -v rathole-x-conf:/etc/rathole-x --restart unless-stopped rathole-x
+# 容器先空配置启动并休眠等待。以下命令原子创建挂载配置，不需要
+# 手写 TOML 或 init 系统：
+docker exec rathole-x rathole-x config set -c /etc/rathole-x/rathole-x.toml --client --remote-addr myserver.com:2333
+docker exec rathole-x rathole-x config add -c /etc/rathole-x/rathole-x.toml myssh --local-addr 172.17.0.1:22
+```
+
+现成的 [docker-compose.yml](examples/docker/docker-compose.yml) 在 `examples/docker/`。client 模式通常需要 `network_mode: host`（或把 `local` 指向容器可达地址，如 docker 网关 `172.17.0.1`）；server 模式直接发布端口即可。
+
+## 运行时连接状态
+
+Windows 上，`status` 还会查询由规范化配置路径派生、受 ACL 保护的**仅本机、只读**命名管道。已认证的本地调用者最多请求一个有界快照，远程客户端被拒绝。`runtime` 是本机快照而非网络探测：包含 schema 版本、角色、进程 ID 与采集时间；client 服务包含 `connecting`、`connected`、`retrying` 或 `stopped`，以及已配置/已解析的**控制通道目标**和连接/错误时间；server 服务包含 `waiting`、`connected` 或 `stopped`，以及已认证控制通道的来源地址和连接/断开元数据。不会暴露 token、密钥、载荷或流量。
+
+进程已停止、仍是旧二进制、使用另一份配置或端点尚未就绪时，`runtime: null` 属于正常结果；`runtime_availability.reason` 给出原因而不会使静态状态查询失败。Linux/systemd 端点仍在计划中。
+
 ## CLI quick start (rathole-x)
 
 `rathole-x` 二进制完全基于子命令；裸运行会打印帮助。用 `run -c` 启动守护进程（上游 `./rathole config.toml` 的位置参数形式在本分支不受支持）。
 
 ```bash
-# 按名称添加服务；省略时自动生成 token。
 #（client 添加前需先设置控制通道服务器：
 #  `config set --client --remote-addr myserver.com:2333`）
 ./rathole-x config add --client "name:my_nas_ssh;local:127.0.0.1:22"

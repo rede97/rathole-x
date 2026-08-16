@@ -6,15 +6,19 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+#[cfg(any(windows, test))]
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+#[cfg(any(windows, test))]
 use sha2::{Digest, Sha256};
 
 pub const RUNTIME_SCHEMA_VERSION: u32 = 2;
+#[cfg(windows)]
 pub(crate) const STATUS_REQUEST: &[u8] = b"rathole-x-status-v1";
+#[cfg(windows)]
 pub(crate) const MAX_STATUS_RESPONSE: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -178,6 +182,7 @@ pub(crate) fn server_registry(services: impl IntoIterator<Item = String>) -> Run
     }))
 }
 
+#[cfg(any(windows, test))]
 pub(crate) fn snapshot(registry: &RuntimeRegistry) -> RuntimeSnapshot {
     let mut snapshot = registry
         .read()
@@ -409,6 +414,7 @@ pub(crate) fn server_disconnected(
 
 /// Derive the local pipe name from a canonical path without leaking that path
 /// into the OS-wide pipe namespace.
+#[cfg(any(windows, test))]
 pub(crate) fn endpoint_for_config(config_path: &Path) -> String {
     let path = canonical_config_path(config_path);
     let mut hasher = Sha256::new();
@@ -417,6 +423,7 @@ pub(crate) fn endpoint_for_config(config_path: &Path) -> String {
     format!(r"\\.\pipe\rathole-x-status-{}", hex::encode(&digest[..16]))
 }
 
+#[cfg(any(windows, test))]
 fn canonical_config_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| {
         if path.is_absolute() {

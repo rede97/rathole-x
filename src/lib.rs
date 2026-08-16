@@ -79,12 +79,47 @@ fn genkey(curve: Option<KeypairType>) -> Result<()> {
 pub(crate) fn os_default_config_path() -> std::path::PathBuf {
     #[cfg(windows)]
     {
-        let base = std::env::var_os("ProgramData")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\ProgramData"));
-        base.join("rathole-x").join("rathole-x.toml")
+        use std::os::windows::ffi::OsStringExt;
+        use windows_sys::Win32::System::Com::CoTaskMemFree;
+        use windows_sys::Win32::UI::Shell::{
+            FOLDERID_ProgramData, SHGetKnownFolderPath, KF_FLAG_DEFAULT,
+        };
+
+        // Do not trust ProgramData from the inherited environment: an
+        // unprivileged caller can set it before UAC elevates this process.
+        // The shell known-folder API returns the system-owned common data
+        let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
+        let result = unsafe {
+            SHGetKnownFolderPath(
+                &FOLDERID_ProgramData,
+                KF_FLAG_DEFAULT as u32,
+                std::ptr::null_mut(),
+                &mut raw,
+            )
+        };
+        if result >= 0 && !raw.is_null() {
+            let mut len = 0;
+            unsafe {
+                while *raw.add(len) != 0 {
+                    len += 1;
+                }
+            }
+            let base =
+                unsafe { std::ffi::OsString::from_wide(std::slice::from_raw_parts(raw, len)) };
+            unsafe { CoTaskMemFree(raw.cast()) };
+            return std::path::PathBuf::from(base)
+                .join("rathole-x")
+                .join("rathole-x.toml");
+        }
+        // ProgramData is a fixed system location. This fallback deliberately
+        // does not use the process environment either.
+        std::path::PathBuf::from(r"C:\ProgramData\rathole-x\rathole-x.toml")
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        std::path::PathBuf::from("/etc/rathole-x/rathole-x.toml")
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         std::path::PathBuf::from("/etc/rathole-x.toml")
     }

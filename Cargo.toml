@@ -1,6 +1,6 @@
 [package]
 name = "rathole"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 authors = ["Yujia Qiao <code@rapiz.me>"]
 description = "A reverse proxy for NAT traversal"
@@ -160,5 +160,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Pipes",
     "Win32_System_Threading",
     "Win32_UI_Shell",
-    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Com",
+    "Win32_System_Pipes",
 ] }

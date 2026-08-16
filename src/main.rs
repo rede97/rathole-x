@@ -48,9 +48,33 @@ async fn main() -> Result<()> {
     }
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
     tokio::spawn(async move {
-        if let Err(e) = signal::ctrl_c().await {
-            // Something really weird happened. So just panic
-            panic!("Failed to listen for the ctrl-c signal: {:?}", e);
+        // `docker stop`, `systemctl stop` and OpenRC's supervise-daemon all
+        // deliver SIGTERM; catch it in addition to ctrl-c so containers and
+        // services shut down cleanly instead of waiting for the SIGKILL
+        // fallback.
+        #[cfg(unix)]
+        let terminated = {
+            use tokio::signal::unix::{signal, SignalKind};
+            match signal(SignalKind::terminate()) {
+                Ok(mut sigterm) => {
+                    async move {
+                        let _ = sigterm.recv().await;
+                    }
+                }
+                Err(e) => panic!("Failed to listen for the SIGTERM signal: {:?}", e),
+            }
+        };
+        #[cfg(not(unix))]
+        let terminated = std::future::pending::<()>();
+
+        tokio::select! {
+            r = signal::ctrl_c() => {
+                if let Err(e) = r {
+                    // Something really weird happened. So just panic
+                    panic!("Failed to listen for the ctrl-c signal: {:?}", e);
+                }
+            }
+            _ = terminated => {}
         }
 
         if let Err(e) = shutdown_tx.send(true) {

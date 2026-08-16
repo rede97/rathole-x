@@ -340,18 +340,41 @@ pub fn ensure_role_config(path: &Path, role: ServiceRole) -> Result<bool> {
     }
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create config directory {}", parent.display())
-            })?;
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                let hint = permission_hint(&e);
+                return Err(e).with_context(|| {
+                    format!(
+                        "Failed to create config directory {}{}",
+                        parent.display(),
+                        hint
+                    )
+                });
+            }
         }
     }
     let skeleton = match role {
         ServiceRole::Client => DEFAULT_CLIENT_CONFIG,
         ServiceRole::Server => DEFAULT_SERVER_CONFIG,
     };
-    write_atomic(path, skeleton)
-        .with_context(|| format!("Failed to write default config {}", path.display()))?;
+    if let Err(e) = write_atomic(path, skeleton) {
+        let hint = e
+            .downcast_ref::<std::io::Error>()
+            .map(permission_hint)
+            .unwrap_or("");
+        return Err(e)
+            .with_context(|| format!("Failed to write default config {}{}", path.display(), hint));
+    }
     Ok(true)
+}
+
+/// A permission failure almost always means the command needs elevation
+/// (sudo on Linux, administrator on Windows).
+fn permission_hint(e: &std::io::Error) -> &'static str {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        " (insufficient permissions; run the command elevated, e.g. with sudo)"
+    } else {
+        ""
+    }
 }
 
 /// Atomically replace `path`: write a unique temp file in the same
@@ -365,6 +388,15 @@ pub fn ensure_role_config(path: &Path, role: ServiceRole) -> Result<bool> {
 fn write_atomic(path: &Path, content: &str) -> Result<()> {
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     std::fs::write(&tmp, content).with_context(|| format!("Failed to write {}", tmp.display()))?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Managed Linux configs can contain credentials. Restrict the
+        // replacement before its name becomes visible at the destination.
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o640))
+            .with_context(|| format!("Failed to secure {}", tmp.display()))?;
+    }
     #[cfg(windows)]
     let replace = crate::platform::replace_file_preserving_security(&tmp, path);
     #[cfg(not(windows))]

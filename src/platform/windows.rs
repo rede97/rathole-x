@@ -340,27 +340,49 @@ fn launch_arguments(config_path: &Path) -> Vec<OsString> {
     ]
 }
 
+/// icacls grant for one service's virtual account. Service names are fixed
+/// by `scm_name` (rathole-x-<role>-<name>), so the account form is safe to
+/// embed and is locale-independent (NT SERVICE is a fixed namespace).
+fn service_account_grant(service: &str, perm: &str) -> OsString {
+    OsString::from(format!("NT SERVICE\\{}:{}", service, perm))
+}
+
+/// SCM names of every service that may execute the shared binary and read
+/// configs in the managed config directory: all installed services plus
+/// the one being installed (`extra`). Several services share one directory
+/// and one self-copied binary, so the lockdown must grant every service's
+/// SID — otherwise installing/upgrading one service would strip another's
+/// access.
+fn managed_service_names(extra: &str) -> Vec<String> {
+    let mut out: Vec<String> = crate::config_edit::list_installed_services()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, role)| scm_name(role, &name))
+        .collect();
+    if !out.iter().any(|s| s == extra) {
+        out.push(extra.to_owned());
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Build the icacls invocations that lock down the service config directory,
-/// the installed binary and the config file to Administrators + SYSTEM,
-/// regardless of who pre-created the directory (the pre-elevation CLI runs
-/// as a normal user, leaving CREATOR OWNER full control otherwise).
-///
-/// Layout: one `/setowner` per path (a user-precreated directory/exe/config
-/// keeps its creator as owner, and an NTFS owner implicitly holds WRITE_DAC —
-/// enough to silently undo every grant below), then one atomic
-/// `/inheritance:r` + explicit grants per path (see `path_lockdown_args` for
-/// why there is no `/reset`). SIDs are locale-independent:
-/// S-1-5-32-544 = Administrators, S-1-5-18 = SYSTEM, S-1-5-32-545 = Users.
-///
-/// The config defaults to Administrators full control (elevated edits),
-/// SYSTEM read (the service only reads it), and Users read so read-only
-/// `status --name` can render the configured ports without UAC. With
-/// `allow_user_config` the directory grants Users create-files (atomic write
-/// + rename) and the config grants Users modify.
+/// the installed binary, the config file and the log directory.
+/// Administrators and SYSTEM keep full control; each service's virtual
+/// account (NT SERVICE\<scm-name>, required by its write-restricted token)
+/// gets exactly the access the relay needs: traverse/read the directory,
+/// execute the binary, read the config and write its own logs. Local users
+/// get read-only access to the installed directory/config so `status --name`
+/// can render the configured ports without UAC. With `allow_user_config`
+/// the directory additionally grants Users create-files and the config
+/// Users modify.
 fn lockdown_icacls_args(
     dir: &Path,
     exe: &Path,
     config: &Path,
+    logs: &Path,
+    services: &[String],
     allow_user_config: bool,
 ) -> Vec<Vec<OsString>> {
     let admins_full = OsString::from("*S-1-5-32-544:F");
@@ -383,6 +405,11 @@ fn lockdown_icacls_args(
     let system_dir_full = OsString::from("*S-1-5-18:(OI)(CI)F");
     let users_dir_read = OsString::from("*S-1-5-32-545:(OI)(CI)R");
     let mut dir_grants: Vec<&OsStr> = vec![&admins_dir_full, &system_dir_full, &users_dir_read];
+    let service_dir_grants: Vec<OsString> = services
+        .iter()
+        .map(|s| service_account_grant(s, "(OI)(CI)RX"))
+        .collect();
+    dir_grants.extend(service_dir_grants.iter().map(|g| g.as_os_str()));
     if allow_user_config {
         // Directory-local only: Users may create files here; the files
         // themselves are owned (and thus writable) by their creator.
@@ -390,13 +417,30 @@ fn lockdown_icacls_args(
     }
     cmds.extend(path_lockdown_args(dir, &dir_grants));
 
-    cmds.extend(exe_lockdown_args(exe));
+    cmds.extend(exe_lockdown_args(exe, services));
 
     let mut config_grants: Vec<&OsStr> = vec![&admins_full, &system_read, &users_read];
+    let service_config_grants: Vec<OsString> = services
+        .iter()
+        .map(|s| service_account_grant(s, "(R)"))
+        .collect();
+    config_grants.extend(service_config_grants.iter().map(|g| g.as_os_str()));
     if allow_user_config {
         config_grants.push(&users_modify);
     }
     cmds.extend(path_lockdown_args(config, &config_grants));
+
+    // The log directory is the only place the service writes: Modify for
+    // each service SID, inheritable so rotated log files keep write access.
+    let admins_logs_full = OsString::from("*S-1-5-32-544:(OI)(CI)F");
+    let system_logs_full = OsString::from("*S-1-5-18:(OI)(CI)F");
+    let mut logs_grants: Vec<&OsStr> = vec![&admins_logs_full, &system_logs_full];
+    let service_logs_grants: Vec<OsString> = services
+        .iter()
+        .map(|s| service_account_grant(s, "(OI)(CI)M"))
+        .collect();
+    logs_grants.extend(service_logs_grants.iter().map(|g| g.as_os_str()));
+    cmds.extend(path_lockdown_args(logs, &logs_grants));
 
     cmds
 }
@@ -435,11 +479,55 @@ fn path_lockdown_args(path: &Path, grants: &[&OsStr]) -> Vec<Vec<OsString>> {
 /// The binary lockdown, shared by `install` (via `lockdown_icacls_args`)
 /// and `upgrade` (re-applied after the binary is replaced: the replacement
 /// inherits the temp file's security descriptor, which would leave a
-/// user-replaceable LocalSystem service binary behind).
-fn exe_lockdown_args(exe: &Path) -> Vec<Vec<OsString>> {
+/// user-replaceable service binary behind). Each service SID gets RX so
+/// its write-restricted token can execute it.
+fn exe_lockdown_args(exe: &Path, services: &[String]) -> Vec<Vec<OsString>> {
     let admins = OsString::from("*S-1-5-32-544:F");
     let system = OsString::from("*S-1-5-18:F");
-    path_lockdown_args(exe, &[&admins, &system])
+    let mut grants: Vec<OsString> = vec![admins, system];
+    grants.extend(services.iter().map(|s| service_account_grant(s, "(RX)")));
+    let grant_refs: Vec<&OsStr> = grants.iter().map(|g| g.as_os_str()).collect();
+    path_lockdown_args(exe, &grant_refs)
+}
+
+/// Run one `sc.exe` invocation; failures are fatal to the caller.
+fn run_sc(args: &[&str]) -> Result<()> {
+    let status = std::process::Command::new("sc.exe")
+        .args(args)
+        .status()
+        .with_context(|| format!("failed to run `sc.exe {}`", args.join(" ")))?;
+    if !status.success() {
+        bail!("`sc.exe {}` failed (exit {})", args.join(" "), status);
+    }
+    Ok(())
+}
+
+/// Least-privilege token hardening for one installed service: a
+/// write-restricted per-service SID plus exactly the privileges the relay
+/// needs (SeChangeNotifyPrivilege is required by every Win32 process).
+/// The service account itself (NT AUTHORITY\LocalService) is set at
+/// creation time in `install`.
+fn configure_service_hardening(service: &str) -> Result<()> {
+    run_sc(&["sidtype", service, "restricted"])?;
+    run_sc(&["privs", service, "SeChangeNotifyPrivilege"])
+}
+
+/// Best-effort migration of a service installed before the least-privilege
+/// change (LocalSystem, unrestricted SID). Called during upgrade; failures
+/// are logged, never fatal to the binary upgrade.
+fn migrate_service_hardening(service: &str) {
+    for args in [
+        vec!["config", service, "obj=", "NT AUTHORITY\\LocalService"],
+        vec!["sidtype", service, "restricted"],
+        vec!["privs", service, "SeChangeNotifyPrivilege"],
+    ] {
+        if let Err(e) = run_sc(&args) {
+            warn!(
+                "failed to migrate service '{}' to the least-privilege account: {:#}",
+                service, e
+            );
+        }
+    }
 }
 
 /// Atomically replace `replaced` with `replacement` while KEEPING the
@@ -533,7 +621,9 @@ fn run_icacls(args: &[OsString]) -> Result<()> {
 /// `"<current_exe>" service run --config "<config_path>"` at boot.
 /// Also writes the `version.toml` policy and locks the config directory,
 /// binary and config down to Administrators + SYSTEM (plus Users write on
-/// the config only when `allow_user_config`).
+/// the config only when `allow_user_config`). The service runs as
+/// NT AUTHORITY\LocalService with a write-restricted per-service SID, so
+/// its token can only touch the paths explicitly granted to it.
 pub fn install(opts: &ServiceInstallOptions) -> Result<()> {
     let dir = opts
         .config_path
@@ -568,16 +658,26 @@ pub fn install(opts: &ServiceInstallOptions) -> Result<()> {
     let installed_exe = dir.join(exe_name);
     ensure_binary_copy(&exe, &installed_exe)?;
 
-    // Lock down the directory, the service binary and the config BEFORE the
-    // service is registered: the directory may have been pre-created by the
-    // un-elevated CLI (CREATOR OWNER = the installing user) or `--config`
-    // may point at any user-writable directory; either way a LocalSystem
-    // service must never run a binary or read secrets from a location a
-    // normal user can replace or read.
+    let service_name = scm_name(opts.role, &opts.name);
+
+    // Lock down the directory, the service binary, the config and the log
+    // directory BEFORE the service is registered: the directory may have
+    // been pre-created by the un-elevated CLI (CREATOR OWNER = the
+    // installing user) or `--config` may point at any user-writable
+    // directory; either way the service must never run a binary or read
+    // secrets from a location a normal user can replace or read.
+    // The log directory is pre-created so the write-restricted service
+    // token never needs to create directories.
+    let log_dir = dir.join("logs");
+    std::fs::create_dir_all(&log_dir)
+        .with_context(|| format!("failed to create log directory {}", log_dir.display()))?;
+    let services = managed_service_names(&service_name);
     for args in lockdown_icacls_args(
         &dir,
         &installed_exe,
         &opts.config_path,
+        &log_dir,
+        &services,
         opts.allow_user_config,
     ) {
         run_icacls(&args)?;
@@ -589,7 +689,6 @@ pub fn install(opts: &ServiceInstallOptions) -> Result<()> {
     )
     .context("failed to open the service control manager (elevated rights required)")?;
 
-    let service_name = scm_name(opts.role, &opts.name);
     let service_info = ServiceInfo {
         name: OsString::from(&service_name),
         display_name: OsString::from(format!("rathole-x ({})", service_name)),
@@ -599,7 +698,9 @@ pub fn install(opts: &ServiceInstallOptions) -> Result<()> {
         executable_path: installed_exe.clone(),
         launch_arguments: launch_arguments(&opts.config_path),
         dependencies: vec![],
-        account_name: None, // LocalSystem
+        // Least privilege: a built-in non-interactive account, never
+        // LocalSystem. The SCM grants it "log on as a service" at start.
+        account_name: Some(OsString::from("NT AUTHORITY\\LocalService")),
         account_password: None,
     };
 
@@ -621,6 +722,17 @@ pub fn install(opts: &ServiceInstallOptions) -> Result<()> {
             other => anyhow!(other)
                 .context(format!("failed to create service '{}'", service_name)),
         })?;
+
+    // Restrict the token BEFORE the first start; a service that cannot be
+    // hardened is rolled back rather than left running over-privileged.
+    if let Err(e) = configure_service_hardening(&service_name) {
+        let _ = service.delete();
+        return Err(e).context(format!(
+            "failed to harden service '{}'; rolled back its SCM registration",
+            service_name
+        ));
+    }
+
     if let Err(e) = service.start::<&OsStr>(&[]) {
         // Best-effort rollback: leaving the registration behind would make a
         // retry fail with ERROR_SERVICE_EXISTS (half-installed state).
@@ -1429,6 +1541,13 @@ pub fn upgrade_binary() -> Result<()> {
         }
     }
 
+    // Migrate services installed before the least-privilege change
+    // (LocalSystem, unrestricted SID) while they are stopped. Best-effort:
+    // a failed migration must not block the binary upgrade.
+    for (name, role) in &services {
+        migrate_service_hardening(&scm_name(*role, name));
+    }
+
     // Replace the shared binary. On failure, best-effort restart the
     // services we just stopped before returning the error, so a failed
     // upgrade never leaves every service down.
@@ -1437,12 +1556,16 @@ pub fn upgrade_binary() -> Result<()> {
         .file_name()
         .ok_or_else(|| anyhow!("current executable has no file name"))?;
     let installed = crate::config_edit::config_dir().join(exe_name);
+    let service_names: Vec<String> = services
+        .iter()
+        .map(|(name, role)| scm_name(*role, name))
+        .collect();
     let update_result = (|| -> Result<()> {
         ensure_binary_copy(&exe, &installed)?;
         // The replacement inherits the temp file's security descriptor;
         // re-apply the binary lockdown so an upgrade can never leave a
-        // user-replaceable LocalSystem service binary behind.
-        for args in exe_lockdown_args(&installed) {
+        // user-replaceable service binary behind.
+        for args in exe_lockdown_args(&installed, &service_names) {
             run_icacls(&args)?;
         }
         Ok(())
@@ -2084,11 +2207,13 @@ mod tests {
         let dir = Path::new(r"C:\cfg");
         let exe = Path::new(r"C:\cfg\rathole-x.exe");
         let config = Path::new(r"C:\cfg\config.toml");
-        let cmds = lockdown_icacls_args(dir, exe, config, false);
+        let logs = Path::new(r"C:\cfg\logs");
+        let services = vec!["rathole-x-server-default".to_owned()];
+        let cmds = lockdown_icacls_args(dir, exe, config, logs, &services, false);
 
         // Two invocations per path: /setowner, then one ATOMIC
         // /inheritance:r + grants (no /reset — see path_lockdown_args).
-        assert_eq!(cmds.len(), 6);
+        assert_eq!(cmds.len(), 8);
         // Ownership is taken first so the pre-creation owner cannot
         // rewrite the new DACL.
         assert_eq!(cmds[0][0].as_os_str(), dir.as_os_str());
@@ -2096,22 +2221,29 @@ mod tests {
         assert_eq!(cmds[1][0].as_os_str(), dir.as_os_str());
         assert_eq!(
             cmd_string(&cmds[1]),
-            "/inheritance:r /grant *S-1-5-32-544:(OI)(CI)F /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-545:(OI)(CI)R"
+            "/inheritance:r /grant *S-1-5-32-544:(OI)(CI)F /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-545:(OI)(CI)R /grant NT SERVICE\\rathole-x-server-default:(OI)(CI)RX"
         );
         assert_eq!(cmds[2][0].as_os_str(), exe.as_os_str());
         assert_eq!(cmd_string(&cmds[2]), "/setowner *S-1-5-32-544");
         assert_eq!(cmds[3][0].as_os_str(), exe.as_os_str());
         assert_eq!(
             cmd_string(&cmds[3]),
-            "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:F"
+            "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:F /grant NT SERVICE\\rathole-x-server-default:(RX)"
         );
         assert_eq!(cmds[4][0].as_os_str(), config.as_os_str());
         assert_eq!(cmd_string(&cmds[4]), "/setowner *S-1-5-32-544");
-        // Config: read-only `status` works without UAC, but only
-        // Administrators may edit by default.
+        // Config: read-only `status` works without UAC; SYSTEM and the
+        // service SID only need read, and only Administrators edit by default.
         assert_eq!(
             cmd_string(&cmds[5]),
-            "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:R /grant *S-1-5-32-545:R"
+            "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:R /grant *S-1-5-32-545:R /grant NT SERVICE\\rathole-x-server-default:(R)"
+        );
+        assert_eq!(cmds[6][0].as_os_str(), logs.as_os_str());
+        assert_eq!(cmd_string(&cmds[6]), "/setowner *S-1-5-32-544");
+        // Logs: the only writable location, scoped to the service SID.
+        assert_eq!(
+            cmd_string(&cmds[7]),
+            "/inheritance:r /grant *S-1-5-32-544:(OI)(CI)F /grant *S-1-5-18:(OI)(CI)F /grant NT SERVICE\\rathole-x-server-default:(OI)(CI)M"
         );
         for cmd in [&cmds[2], &cmds[3], &cmds[4], &cmds[5]] {
             let s = cmd_string(cmd);
@@ -2132,25 +2264,27 @@ mod tests {
         let dir = Path::new(r"C:\cfg");
         let exe = Path::new(r"C:\cfg\rathole-x.exe");
         let config = Path::new(r"C:\cfg\config.toml");
-        let cmds = lockdown_icacls_args(dir, exe, config, true);
+        let logs = Path::new(r"C:\cfg\logs");
+        let services = vec!["rathole-x-server-default".to_owned()];
+        let cmds = lockdown_icacls_args(dir, exe, config, logs, &services, true);
 
-        assert_eq!(cmds.len(), 6);
+        assert_eq!(cmds.len(), 8);
         // Directory: grants are inheritable so the DACL rewrite propagates
         // as valid child ACEs instead of stripping the children to an
         // empty DACL; Users may read and create files (atomic write + rename)...
         assert_eq!(
             cmd_string(&cmds[1]),
-            "/inheritance:r /grant *S-1-5-32-544:(OI)(CI)F /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-545:(OI)(CI)R /grant *S-1-5-32-545:WD"
+            "/inheritance:r /grant *S-1-5-32-544:(OI)(CI)F /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-545:(OI)(CI)R /grant NT SERVICE\\rathole-x-server-default:(OI)(CI)RX /grant *S-1-5-32-545:WD"
         );
-        // ...the binary is never user-writable (LocalSystem escalation)...
+        // ...the binary is never user-writable (privilege escalation)...
         assert_eq!(
             cmd_string(&cmds[3]),
-            "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:F"
+            "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:F /grant NT SERVICE\\rathole-x-server-default:(RX)"
         );
         // ...and the config gets Users read+modify.
         assert_eq!(
             cmd_string(&cmds[5]),
-            "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:R /grant *S-1-5-32-545:R /grant *S-1-5-32-545:M"
+            "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:R /grant *S-1-5-32-545:R /grant NT SERVICE\\rathole-x-server-default:(R) /grant *S-1-5-32-545:M"
         );
     }
     #[tokio::test]
