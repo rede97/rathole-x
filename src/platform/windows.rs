@@ -352,10 +352,11 @@ fn launch_arguments(config_path: &Path) -> Vec<OsString> {
 /// why there is no `/reset`). SIDs are locale-independent:
 /// S-1-5-32-544 = Administrators, S-1-5-18 = SYSTEM, S-1-5-32-545 = Users.
 ///
-/// The config defaults to Administrators full control (elevated edits) and
-/// SYSTEM read (the service only reads it). With `allow_user_config` the
-/// directory additionally grants Users create-files (atomic write + rename)
-/// and the config grants Users modify — never read-for-everyone.
+/// The config defaults to Administrators full control (elevated edits),
+/// SYSTEM read (the service only reads it), and Users read so read-only
+/// `status --name` can render the configured ports without UAC. With
+/// `allow_user_config` the directory grants Users create-files (atomic write
+/// + rename) and the config grants Users modify.
 fn lockdown_icacls_args(
     dir: &Path,
     exe: &Path,
@@ -366,6 +367,7 @@ fn lockdown_icacls_args(
     let mut cmds: Vec<Vec<OsString>> = Vec::new();
 
     let system_read = OsString::from("*S-1-5-18:R");
+    let users_read = OsString::from("*S-1-5-32-545:R");
     let users_create = OsString::from("*S-1-5-32-545:WD");
     let users_modify = OsString::from("*S-1-5-32-545:M");
 
@@ -379,7 +381,8 @@ fn lockdown_icacls_args(
     // child is then locked individually below.
     let admins_dir_full = OsString::from("*S-1-5-32-544:(OI)(CI)F");
     let system_dir_full = OsString::from("*S-1-5-18:(OI)(CI)F");
-    let mut dir_grants: Vec<&OsStr> = vec![&admins_dir_full, &system_dir_full];
+    let users_dir_read = OsString::from("*S-1-5-32-545:(OI)(CI)R");
+    let mut dir_grants: Vec<&OsStr> = vec![&admins_dir_full, &system_dir_full, &users_dir_read];
     if allow_user_config {
         // Directory-local only: Users may create files here; the files
         // themselves are owned (and thus writable) by their creator.
@@ -389,7 +392,7 @@ fn lockdown_icacls_args(
 
     cmds.extend(exe_lockdown_args(exe));
 
-    let mut config_grants: Vec<&OsStr> = vec![&admins_full, &system_read];
+    let mut config_grants: Vec<&OsStr> = vec![&admins_full, &system_read, &users_read];
     if allow_user_config {
         config_grants.push(&users_modify);
     }
@@ -2014,7 +2017,7 @@ mod tests {
 
         // Install-time lockdown shape for the config DACL under
         // --allow-user-config: inheritance off, Administrators full,
-        // SYSTEM read, Users modify — the exact scenario the preserved
+        // SYSTEM read, Users read+modify — the exact scenario the preserved
         // descriptor must survive (an un-elevated user CLI writes the
         // config; the watcher service keeps reading it as SYSTEM).
         // (The /setowner step of the real lockdown is skipped: setting the
@@ -2026,6 +2029,8 @@ mod tests {
             "*S-1-5-32-544:F",
             "/grant",
             "*S-1-5-18:R",
+            "/grant",
+            "*S-1-5-32-545:R",
             "/grant",
             "*S-1-5-32-545:M",
         ]] {
@@ -2091,7 +2096,7 @@ mod tests {
         assert_eq!(cmds[1][0].as_os_str(), dir.as_os_str());
         assert_eq!(
             cmd_string(&cmds[1]),
-            "/inheritance:r /grant *S-1-5-32-544:(OI)(CI)F /grant *S-1-5-18:(OI)(CI)F"
+            "/inheritance:r /grant *S-1-5-32-544:(OI)(CI)F /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-545:(OI)(CI)R"
         );
         assert_eq!(cmds[2][0].as_os_str(), exe.as_os_str());
         assert_eq!(cmd_string(&cmds[2]), "/setowner *S-1-5-32-544");
@@ -2102,19 +2107,24 @@ mod tests {
         );
         assert_eq!(cmds[4][0].as_os_str(), config.as_os_str());
         assert_eq!(cmd_string(&cmds[4]), "/setowner *S-1-5-32-544");
-        // Config: SYSTEM only needs read; no Users access by default.
+        // Config: read-only `status` works without UAC, but only
+        // Administrators may edit by default.
         assert_eq!(
             cmd_string(&cmds[5]),
-            "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:R"
+            "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:R /grant *S-1-5-32-545:R"
         );
-        for cmd in &cmds {
+        for cmd in [&cmds[2], &cmds[3], &cmds[4], &cmds[5]] {
             let s = cmd_string(cmd);
             assert!(
-                !s.contains("S-1-5-32-545"),
-                "no Users grants without --allow-user-config: {}",
+                !s.contains("S-1-5-32-545:W") && !s.contains("S-1-5-32-545:M"),
+                "no Users write grants without --allow-user-config: {}",
                 s
             );
         }
+        assert!(
+            !cmd_string(&cmds[3]).contains("S-1-5-32-545"),
+            "the installed binary is never user-readable/writable"
+        );
     }
 
     #[test]
@@ -2127,20 +2137,20 @@ mod tests {
         assert_eq!(cmds.len(), 6);
         // Directory: grants are inheritable so the DACL rewrite propagates
         // as valid child ACEs instead of stripping the children to an
-        // empty DACL; Users may create files (atomic write + rename)...
+        // empty DACL; Users may read and create files (atomic write + rename)...
         assert_eq!(
             cmd_string(&cmds[1]),
-            "/inheritance:r /grant *S-1-5-32-544:(OI)(CI)F /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-545:WD"
+            "/inheritance:r /grant *S-1-5-32-544:(OI)(CI)F /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-545:(OI)(CI)R /grant *S-1-5-32-545:WD"
         );
         // ...the binary is never user-writable (LocalSystem escalation)...
         assert_eq!(
             cmd_string(&cmds[3]),
             "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:F"
         );
-        // ...and the config gets Users modify (write), never world-read.
+        // ...and the config gets Users read+modify.
         assert_eq!(
             cmd_string(&cmds[5]),
-            "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:R /grant *S-1-5-32-545:M"
+            "/inheritance:r /grant *S-1-5-32-544:F /grant *S-1-5-18:R /grant *S-1-5-32-545:R /grant *S-1-5-32-545:M"
         );
     }
     #[tokio::test]

@@ -29,7 +29,7 @@ main.rs
 - `src/lib.rs` owns dispatch, JSON envelopes, confirmation policy, run supervision, and `determine_run_mode`.
 - `src/config_watcher.rs` emits `ConfigChange::General` for section/non-service changes (restart only the instance generation) and per-service Add/Delete events for live application. Invalid rescans retain the prior config.
 - Client control channels authenticate per service; server control channels are keyed by service digest. Data channels are created on demand. The server uses TCP pool size 8 and UDP pool size 1.
-- `src/runtime_status.rs` is a local management plane, not proxy protocol. It tracks client/server control channels and listener state. Windows exposes snapshots through an ACL-protected named pipe derived from the canonical config path; `status` merges that snapshot with SCM and static config data.
+- `src/runtime_status.rs` is a local management plane, not proxy protocol. It tracks client/server control channels and listener state. Windows exposes snapshots through an ACL-protected named pipe derived from the canonical config path; `status` merges that snapshot with SCM and static config data. Read-only status must work without UAC; installed directories/configs are user-readable but only admin-writable unless `--allow-user-config`, and status must distinguish `readable`/`missing`/`denied` instead of collapsing access errors to missing.
 - Use the `src/platform.rs` façade. `src/platform/windows.rs` owns SCM, UAC, ACL, binary upgrade, and named-pipe code; `src/platform/other.rs` provides planned-platform stubs. Keep `lib.rs` and `main.rs` platform-cfg-free.
 
 ## Key Directories

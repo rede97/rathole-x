@@ -379,8 +379,14 @@ fn render_one(
     service: &Option<(String, Option<u32>)>,
     state_known: bool,
 ) -> Result<Value> {
-    let content = std::fs::read_to_string(config_path).ok();
-    let parsed: Option<Config> = content.as_deref().and_then(|c| toml::from_str(c).ok());
+    let read_result = std::fs::read_to_string(config_path);
+    let content = read_result.as_ref().ok();
+    let parsed: Option<Config> = content.and_then(|c| toml::from_str(c).ok());
+    let config_access = match &read_result {
+        Ok(_) => "readable",
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "missing",
+        Err(_) => "denied",
+    };
     let (auth_file_exists, auth_allows_user) = auth_info(config_path);
     let (runtime, runtime_snapshot, runtime_unavailable) = runtime_status_for(config_path);
     let result = json!({
@@ -392,6 +398,8 @@ fn render_one(
         "config": {
             "path": config_path,
             "exists": content.is_some(),
+            "readable": read_result.is_ok(),
+            "access": config_access,
             "valid": parsed.is_some(),
             "auth": {
                 "version_file_exists": auth_file_exists,
@@ -458,10 +466,10 @@ fn render_one(
             print!("{}", out);
         }
         None => {
-            let hint = if content.is_none() {
-                "file missing — run `rathole-x service install server|client --yes`"
-            } else {
-                "invalid configuration — run `rathole-x config set` or fix the file"
+            let hint = match config_access {
+                "missing" => "config file missing — run `rathole-x service install server|client --yes`",
+                "denied" => "config permission denied — static config tree hidden; service and runtime state above remain readable",
+                _ => "invalid configuration — run `rathole-x config set` or fix the file",
             };
             println!("{}", colorize(hint, YELLOW));
         }
@@ -469,22 +477,35 @@ fn render_one(
     Ok(result)
 }
 
-/// SCM state of the named service, inferred from the role found in its
-/// config file. `None` when the config is unreadable or the service is not
-/// installed.
+/// SCM state of the named service. The running runtime snapshot is the
+/// preferred role source because the installed config may be unreadable to a
+/// normal user by ACL; the readable config is the fallback.
 fn service_state_for(name: &str, config_path: &Path) -> Option<(String, Option<u32>)> {
     #[cfg(windows)]
     {
-        let role = std::fs::read_to_string(config_path)
-            .ok()
-            .and_then(|c| toml::from_str::<Config>(&c).ok())
-            .map(|c| {
-                if c.client.is_some() {
-                    crate::config_edit::ServiceRole::Client
-                } else {
-                    crate::config_edit::ServiceRole::Server
-                }
-            })?;
+        let runtime_role =
+            crate::platform::query_runtime_status(config_path)
+                .ok()
+                .map(|snapshot| match snapshot.role {
+                    crate::runtime_status::RuntimeRole::Client => {
+                        crate::config_edit::ServiceRole::Client
+                    }
+                    crate::runtime_status::RuntimeRole::Server => {
+                        crate::config_edit::ServiceRole::Server
+                    }
+                });
+        let role = runtime_role.or_else(|| {
+            std::fs::read_to_string(config_path)
+                .ok()
+                .and_then(|c| toml::from_str::<Config>(&c).ok())
+                .map(|c| {
+                    if c.client.is_some() {
+                        crate::config_edit::ServiceRole::Client
+                    } else {
+                        crate::config_edit::ServiceRole::Server
+                    }
+                })
+        })?;
         query_named_service(role.key(), name)
     }
     #[cfg(not(windows))]
@@ -609,6 +630,7 @@ token = "abc"
             };
             let result = run_status(&args).unwrap();
             if json {
+                assert_eq!(result["config"]["access"], "readable");
                 assert!(result["runtime"].is_null());
                 assert_eq!(result["runtime_availability"]["available"], false);
             }
@@ -623,6 +645,23 @@ token = "abc"
         let result = run_status(&args).unwrap();
         assert!(result["runtime"].is_null());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn status_missing_file_reports_missing_not_denied() {
+        let dir =
+            std::env::temp_dir().join(format!("rathole-x-status-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("missing.toml");
+        let args = StatusArgs {
+            config: Some(path),
+            name: None,
+            json: true,
+        };
+        let result = run_status(&args).unwrap();
+        assert_eq!(result["config"]["access"], "missing");
+        assert_eq!(result["config"]["exists"], false);
         std::fs::remove_dir_all(&dir).ok();
     }
     #[test]

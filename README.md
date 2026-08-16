@@ -26,7 +26,7 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 - **One process, one role.** Every foreground or installed process runs exactly one role (server or client) from one role-specific config. To run both on a host, configure and run two independent processes.
 - **Upstream-compatible wire protocol.** `rathole-x` speaks the same wire protocol as upstream rathole, so the two interoperate.
 - **Platform integration.** Windows SCM service plus UAC elevation; Linux systemd is planned (see [docs/plan-linux-service.md](docs/plan-linux-service.md)).
-- **Secure defaults.** Tokens are mandatory; config edits are gated by the actual file permissions — the CLI probes whether the current user can write the config and elevates (UAC) only when not; the service binary is copied into `ProgramData` and is not replaceable by non-admins.
+- **Secure defaults.** Tokens are mandatory; config edits are gated by the actual file permissions — the CLI probes whether the current user can write the config and elevates (UAC) only when not; the service binary is copied into `ProgramData` and is not replaceable by non-admins. Read-only status (SCM state, runtime connection snapshot, and the installed config tree) is readable by local users without UAC; `permission denied`, `missing`, and `unavailable` are reported distinctly.
 
 ## New features over upstream
 

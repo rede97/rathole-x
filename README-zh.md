@@ -25,7 +25,7 @@ rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://g
 - **一个进程一个角色。** 每个前台或已安装进程只运行 server 或 client 之一，并使用角色专属配置；同一主机需要两种角色时配置并运行两个独立进程。
 - **与上游兼容的线协议。** `rathole-x` 使用与上游 rathole 相同的线协议，因此二者可互通。
 - **平台集成。** Windows SCM 服务 + UAC 提权；Linux systemd 已规划（见 [docs/plan-linux-service.md](docs/plan-linux-service.md)）。
-- **安全默认值。** token 为必填；配置编辑受实际文件权限约束——CLI 会探测当前用户是否可写该配置，仅当不可写时才提权（UAC）；服务二进制被复制到 `ProgramData`，非管理员无法替换。
+- **安全默认值。** token 为必填；配置编辑受实际文件权限约束——CLI 会探测当前用户是否可写该配置，仅当不可写时才提权（UAC）；服务二进制被复制到 `ProgramData`，非管理员无法替换。只读状态（SCM 状态、runtime 连接快照、已安装配置树）对本地用户可读、无需 UAC；`permission denied`、`missing`、`unavailable` 三类原因分别明确报告。
 
 ## New features over upstream
 
@@ -39,7 +39,7 @@ rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://g
 
 ## Quick start (Windows)
 
-1. 从已提权的 shell 安装服务。安装前会弹出交互式确认（传入 `--yes` 可跳过；非交互 shell 不传 `--yes` 时只会打印用法）。若缺少配置文件则自动创建角色专属的骨架配置，二进制被复制到配置旁，并以 UAC 提权注册一个 Windows SCM 服务（AutoStart）：
+1. 从已提权的 shell 安装服务。安装前会弹出交互式确认（传入 `--yes` 可跳过；非交互或 `--json` 调用不传 `--yes` 时返回可操作错误并以非零退出）。若缺少配置文件则自动创建角色专属的骨架配置，二进制被复制到配置旁，并以 UAC 提权注册一个 Windows SCM 服务（AutoStart）：
 
 ```bash
 # 服务端（公网 IP）
