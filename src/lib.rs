@@ -115,7 +115,11 @@ pub(crate) fn os_default_config_path() -> std::path::PathBuf {
         // does not use the process environment either.
         std::path::PathBuf::from(r"C:\ProgramData\rathole-x\rathole-x.toml")
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        std::path::PathBuf::from("/etc/rathole-x/rathole-x.toml")
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         std::path::PathBuf::from("/etc/rathole-x.toml")
     }

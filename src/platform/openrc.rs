@@ -23,6 +23,9 @@ const INITD_DIR: &str = "/etc/init.d";
 /// Where supervise-daemon pidfiles live.
 const RUN_DIR: &str = "/run";
 
+/// Where supervise-daemon writes the relay's stdout/stderr.
+const LOG_DIR: &str = "/var/log";
+
 // ---------------------------------------------------------------------------
 // Service helpers
 // ---------------------------------------------------------------------------
@@ -40,7 +43,14 @@ fn pidfile_path(svc: &str) -> PathBuf {
     Path::new(RUN_DIR).join(format!("{}.pid", svc))
 }
 
-/// Run `rc-<tool> <args>`, passing stderr through verbatim on failure.
+/// The supervise-daemon output/error log of an installed service. Embedded
+/// in the init.d script and pre-created at install time.
+fn log_path(svc: &str) -> PathBuf {
+    Path::new(LOG_DIR).join(format!("{}.log", svc))
+}
+
+/// Run a tool (`rc-update`, `rc-service`, `chown`, …), passing stderr
+/// through verbatim on failure.
 fn run_rc(tool: &str, args: &[&str]) -> Result<()> {
     let output = Command::new(tool)
         .args(args)
@@ -64,6 +74,34 @@ fn try_rc(tool: &str, args: &[&str]) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Pre-create the service log for the unprivileged service account.
+///
+/// OpenRC redirects the child's stdout/stderr to output_log/error_log, but
+/// the redirect happens as the service user: /var/log is root:root 0755, so
+/// the rathole-x account cannot create the file and the freshly spawned
+/// relay dies immediately (supervise-daemon then respawns it forever).
+/// Creating the log here, owned by the service account, keeps the relay
+/// alive. Idempotent: an existing log (reinstall, rotation) is re-owned and
+/// re-permissioned, never truncated. Only called as root during install,
+/// after `ensure_service_account`.
+fn ensure_log_file(svc: &str) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+    let path = log_path(svc);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o640)
+        .open(&path)
+        .with_context(|| format!("failed to create log file {}", path.display()))?;
+    // An existing file keeps its mode; enforce 0640 either way.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
+        .with_context(|| format!("failed to chmod {}", path.display()))?;
+    let owner = format!("{}:{}", super::SERVICE_ACCOUNT, super::SERVICE_GROUP);
+    let value = path.display().to_string();
+    run_rc("chown", &[owner.as_str(), value.as_str()])
 }
 
 /// OpenRC refuses to manage services when it did not boot the system
@@ -108,6 +146,24 @@ fn shell_quote(path: &Path) -> Result<String> {
     }
 }
 
+/// libcap IAB tuple passed to supervise-daemon's `--capabilities`.
+/// `^cap_net_bind_service` keeps CAP_NET_BIND_SERVICE inheritable+ambient;
+/// every `!cap_*` entry drops that capability from the bounding set.
+/// libcap's IAB parser (verified 2.78) has no "all" aggregate — `!all`,
+/// `all=`, `-all`, `none` are all rejected — so the drops are enumerated
+/// explicitly. Verified on Alpine (libcap 2.78, openrc 0.63.2): the
+/// daemon ends up with exactly 0x400 (CAP_NET_BIND_SERVICE) in
+/// CapInh/CapPrm/CapBnd/CapAmb.
+const RESTRICTED_IAB: &str = "!cap_chown,!cap_dac_override,!cap_dac_read_search,\
+!cap_fowner,!cap_fsetid,!cap_kill,!cap_setgid,!cap_setuid,!cap_setpcap,\
+!cap_linux_immutable,!cap_net_broadcast,!cap_net_admin,!cap_net_raw,!cap_ipc_lock,\
+!cap_ipc_owner,!cap_sys_module,!cap_sys_rawio,!cap_sys_chroot,!cap_sys_ptrace,\
+!cap_sys_pacct,!cap_sys_admin,!cap_sys_boot,!cap_sys_nice,!cap_sys_resource,\
+!cap_sys_time,!cap_sys_tty_config,!cap_mknod,!cap_lease,!cap_audit_write,\
+!cap_audit_control,!cap_setfcap,!cap_mac_override,!cap_mac_admin,!cap_syslog,\
+!cap_wake_alarm,!cap_block_suspend,!cap_audit_read,!cap_perfmon,!cap_bpf,\
+!cap_checkpoint_restore,^cap_net_bind_service";
+
 /// Render the openrc-run script contents. Pure function for testability.
 ///
 /// OpenRC forwards `command_args_foreground` to the daemon when
@@ -120,15 +176,19 @@ fn render_initd(exe: &Path, config: &Path, svc: &str) -> Result<String> {
 description="rathole-x reverse proxy service (single role)"
 command={exe}
 command_args_foreground="run --config {config}"
-command_user="{user}:{group}"
-# supervise-daemon parses libcap IAB text; `^` grants the daemon
-# this sole ambient capability (not setcap's `+ep` file syntax).
-capabilities="^cap_net_bind_service"
+# Bare user name only: openrc-run expands `$command_user` unquoted and
+# supervise-daemon takes --user as ONE argument — a "user:group" value is
+# split and the group token becomes the daemon's command. `-u` already
+# applies the account's primary group (rathole-x).
+command_user="{user}"
+# libcap IAB text for supervise-daemon (see RESTRICTED_IAB): every
+# capability except net_bind_service is dropped from the bounding set.
+capabilities="{iab}"
 supervisor=supervise-daemon
 pidfile="/run/{svc}.pid"
 respawn_delay=3
-output_log="/var/log/{svc}.log"
-error_log="/var/log/{svc}.log"
+output_log="{log}"
+error_log="{log}"
 rc_ulimit="-n 1048576"
 
 depend() {{
@@ -141,8 +201,9 @@ depend() {{
         exe = shell_quote(exe)?,
         config = shell_quote(config)?,
         svc = svc,
+        log = log_path(svc).display(),
         user = super::SERVICE_ACCOUNT,
-        group = super::SERVICE_GROUP,
+        iab = RESTRICTED_IAB,
     ))
 }
 
@@ -204,6 +265,7 @@ pub(crate) fn install_service(
     std::fs::write(&spath, content)
         .with_context(|| format!("failed to write init.d script {}", spath.display()))?;
     set_executable(&spath)?;
+    ensure_log_file(&svc)?;
 
     run_rc("rc-update", &["add", svc.as_str(), "default"])?;
     run_rc("rc-service", &[svc.as_str(), "start"])?;
@@ -250,6 +312,7 @@ pub(crate) fn uninstall_service(args: &UninstallArgs, config_path: &Path) -> Res
             std::fs::remove_file(&spath)
                 .with_context(|| format!("failed to remove init.d script {}", spath.display()))?;
             let _ = std::fs::remove_file(pidfile_path(&svc));
+            let _ = std::fs::remove_file(log_path(&svc));
         }
         None => {
             println!(
@@ -404,6 +467,10 @@ mod tests {
             pidfile_path("rathole-x-server-default"),
             Path::new("/run/rathole-x-server-default.pid")
         );
+        assert_eq!(
+            log_path("rathole-x-server-default"),
+            Path::new("/var/log/rathole-x-server-default.log")
+        );
     }
 
     #[test]
@@ -421,11 +488,33 @@ mod tests {
         assert!(content
             .contains("command_args_foreground=\"run --config /etc/rathole-x/default.toml\"\n"));
         assert!(!content.contains("\ncommand_args="));
-        assert!(content.contains("command_user=\"rathole-x:rathole-x\"\n"));
-        assert!(content.contains("capabilities=\"^cap_net_bind_service\"\n"));
+        assert!(content.contains("command_user=\"rathole-x\"\n"));
+        assert!(content.contains(&format!("capabilities=\"{RESTRICTED_IAB}\"\n")));
         assert!(!content.contains("cap_net_bind_service+ep"));
+        // Every other capability must be dropped from the bounding set;
+        // libcap's IAB parser has no "all" aggregate to rely on.
+        for cap in [
+            "chown",
+            "dac_override",
+            "setpcap",
+            "net_admin",
+            "sys_admin",
+            "setfcap",
+            "bpf",
+            "checkpoint_restore",
+        ] {
+            assert!(
+                content.contains(&format!("!cap_{cap}")),
+                "missing !cap_{cap}"
+            );
+        }
+        assert!(!content.contains("!cap_net_bind_service"));
         assert!(content.contains("supervisor=supervise-daemon\n"));
         assert!(content.contains("pidfile=\"/run/rathole-x-server-default.pid\"\n"));
+        // output_log/error_log must point at the file install pre-creates.
+        let log = log_path("rathole-x-server-default");
+        assert!(content.contains(&format!("output_log=\"{}\"\n", log.display())));
+        assert!(content.contains(&format!("error_log=\"{}\"\n", log.display())));
         assert!(content.contains("respawn_delay=3\n"));
         assert!(content.contains("rc_ulimit=\"-n 1048576\"\n"));
         assert!(content.contains("after net firewall\n"));
