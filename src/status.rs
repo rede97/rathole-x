@@ -111,9 +111,18 @@ fn status_badge(ok: bool) -> String {
     colorize(text, if ok { GREEN } else { RED })
 }
 
+/// No runtime endpoint (Linux, old binary, stopped service): the state is
+/// unknown, not an error.
+fn status_unknown() -> String {
+    colorize("status: unknown", YELLOW)
+}
+
 fn client_service_detail(runtime: Option<&RuntimeSnapshot>, name: &str) -> String {
+    let Some(snapshot) = runtime else {
+        return format!(" [{}]", status_unknown());
+    };
     let ok = matches!(
-        runtime.and_then(|snapshot| snapshot.services.get(name)),
+        snapshot.services.get(name),
         Some(RuntimeServiceSnapshot::Client {
             state: crate::runtime_status::ClientControlState::Connected,
             ..
@@ -123,7 +132,10 @@ fn client_service_detail(runtime: Option<&RuntimeSnapshot>, name: &str) -> Strin
 }
 
 fn server_service_detail(runtime: Option<&RuntimeSnapshot>, name: &str) -> String {
-    match runtime.and_then(|snapshot| snapshot.services.get(name)) {
+    let Some(snapshot) = runtime else {
+        return format!(" [{}]", status_unknown());
+    };
+    match snapshot.services.get(name) {
         Some(RuntimeServiceSnapshot::Server {
             state: crate::runtime_status::ServerControlState::Connected,
             control_channel_source,
@@ -141,7 +153,7 @@ fn server_service_detail(runtime: Option<&RuntimeSnapshot>, name: &str) -> Strin
 
 fn client_remote_detail(runtime: Option<&RuntimeSnapshot>) -> String {
     let Some(snapshot) = runtime else {
-        return format!(" [{}]", status_badge(false));
+        return format!(" [{}]", status_unknown());
     };
     let connected = snapshot
         .services
@@ -161,8 +173,11 @@ fn client_remote_detail(runtime: Option<&RuntimeSnapshot>) -> String {
 }
 
 fn server_bind_detail(runtime: Option<&RuntimeSnapshot>) -> String {
+    let Some(snapshot) = runtime else {
+        return format!(" [{}]", status_unknown());
+    };
     let ok = matches!(
-        runtime.and_then(|snapshot| snapshot.server_listener.as_ref()),
+        snapshot.server_listener.as_ref(),
         Some(listener) if listener.state == ServerListenerState::Listening
     );
     format!(" [{}]", status_badge(ok))
@@ -729,6 +744,6 @@ token = "abc"
             last_error: None,
         });
         assert_eq!(server_bind_detail(Some(&server)), " [status: ok]");
-        assert_eq!(server_bind_detail(None), " [status: error]");
+        assert_eq!(server_bind_detail(None), " [status: unknown]");
     }
 }
