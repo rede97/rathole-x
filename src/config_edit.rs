@@ -3,6 +3,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Context, Result};
 use rand::RngCore;
@@ -326,8 +327,15 @@ remote_addr = "example.com:2333"  # placeholder; unused until services exist
 /// config was created.
 pub fn ensure_role_config(path: &Path, role: ServiceRole) -> Result<bool> {
     if path.exists() {
-        let content = std::fs::read_to_string(path)
-            .with_context(|| format!("Failed to read config file {}", path.display()))?;
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                let hint = permission_hint(&e);
+                return Err(e).with_context(|| {
+                    format!("Failed to read config file {}{}", path.display(), hint)
+                });
+            }
+        };
         // Full runtime validation, not just serde parsing: a config missing
         // tokens/pkcs12 must fail here, not at service start
         crate::config::Config::validate(&content).with_context(|| {
@@ -336,6 +344,23 @@ pub fn ensure_role_config(path: &Path, role: ServiceRole) -> Result<bool> {
                 path.display()
             )
         })?;
+        // A kept config from a previous install must match the requested
+        // role; otherwise the service would run a config whose [server] /
+        // [client] section does not match its name and status output.
+        let existing = toml_edit::DocumentMut::from_str(&content)
+            .ok()
+            .and_then(|doc| detect_role(&doc).ok());
+        if let Some(existing) = existing {
+            if existing != role {
+                bail!(
+                    "Config {} is a {} config from a previous install; it cannot back a {} service. Remove it (`sudo rm {}`) or uninstall with --purge first",
+                    path.display(),
+                    existing.key(),
+                    role.key(),
+                    path.display()
+                );
+            }
+        }
         return Ok(false);
     }
     if let Some(parent) = path.parent() {
@@ -392,9 +417,10 @@ fn write_atomic(path: &Path, content: &str) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
 
-        // Managed Linux configs can contain credentials. Restrict the
-        // replacement before its name becomes visible at the destination.
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o640))
+        // Managed Linux configs are world-readable (0644), matching the
+        // Windows `status` readability contract. Restrict nothing further:
+        // the managed directory itself is root-owned.
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))
             .with_context(|| format!("Failed to secure {}", tmp.display()))?;
     }
     #[cfg(windows)]

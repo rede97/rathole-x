@@ -55,8 +55,8 @@ getent group rathole-x >/dev/null || fail "rathole-x group missing"
 getent passwd rathole-x >/dev/null || fail "rathole-x account missing"
 [ -x "$BIN" ] || fail "deployed binary $BIN missing"
 assert_file_mode "$BIN" "root:root 755"
-assert_file_mode /etc/rathole-x "root:rathole-x 750"
-assert_file_mode "$CONF" "root:rathole-x 640"
+assert_file_mode /etc/rathole-x "root:rathole-x 755"
+assert_file_mode "$CONF" "root:rathole-x 644"
 grep -q 'command_user="rathole-x"' /etc/init.d/"$SVC" \
     || fail "init.d script does not run the relay as rathole-x"
 grep -q 'command_args_foreground="run --config' /etc/init.d/"$SVC" \
@@ -116,5 +116,30 @@ echo "=== uninstall --purge leaves nothing behind ==="
 [ ! -e "$CONF" ] || fail "config left behind"
 ! rc-update show default | grep -q "$SVC" || fail "runlevel entry left behind"
 ! relay_pid >/dev/null || fail "relay process still running"
+
+echo "=== kept config blocks a mismatched-role install ==="
+/usr/local/bin/rathole-x service install server --name "$NAME" --yes >/dev/null
+/usr/local/bin/rathole-x service uninstall --yes --name "$NAME" >/dev/null
+[ -e "$CONF" ] || fail "config was not kept by a normal uninstall"
+OUT=$(/usr/local/bin/rathole-x service install client --name "$NAME" --yes 2>&1 || true)
+echo "$OUT" | grep -qi "server config" \
+    || fail "install client over a kept server config was not rejected: $OUT"
+echo "mismatched-role install rejected: OK"
+
+echo "=== uninstall --purge removes a leftover config without a unit ==="
+/usr/local/bin/rathole-x service uninstall --purge --yes --name "$NAME"
+[ ! -e "$CONF" ] || fail "leftover config survived uninstall --purge"
+[ ! -e /etc/rathole-x/version.toml ] || fail "version.toml survived uninstall --purge"
+
+echo "=== uninstall --all keeps configs; --all --purge removes them ==="
+/usr/local/bin/rathole-x service install server --name "$NAME" --yes >/dev/null
+/usr/local/bin/rathole-x service uninstall --all --yes >/dev/null
+[ -e "$CONF" ] || fail "uninstall --all must keep configs"
+[ ! -e /etc/init.d/"$SVC" ] || fail "init.d script survived uninstall --all"
+[ ! -e "$BIN" ] || fail "deployed binary survived uninstall --all"
+/usr/local/bin/rathole-x service install server --name "$NAME" --yes >/dev/null
+/usr/local/bin/rathole-x service uninstall --all --purge --yes >/dev/null
+[ ! -e "$CONF" ] || fail "config survived uninstall --all --purge"
+[ ! -e /etc/init.d/"$SVC" ] || fail "init.d script survived uninstall --all --purge"
 
 echo "=== ALL OPENRC CHECKS PASSED ==="

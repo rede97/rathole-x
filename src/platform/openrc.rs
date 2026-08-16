@@ -287,7 +287,7 @@ fn set_executable(path: &Path) -> Result<()> {
 /// CLI flow for `service uninstall`: stop the service, remove it from the
 /// runlevels, and delete the init.d script. The config remains protected unless
 /// `--purge` removes it. When the service is already gone the leftover files
-/// are removed without root, mirroring Windows.
+/// are still cleaned up (purge of the root-owned config requires root).
 pub(crate) fn uninstall_service(args: &UninstallArgs, config_path: &Path) -> Result<()> {
     let name = config_path
         .file_stem()
@@ -316,13 +316,13 @@ pub(crate) fn uninstall_service(args: &UninstallArgs, config_path: &Path) -> Res
         }
         None => {
             println!(
-                "Service '{}' is not installed; removing leftover files without root.",
+                "Service '{}' is not installed; cleaning up leftover files.",
                 name
             );
         }
     }
 
-    super::remove_service_files(config_path, args.purge);
+    super::remove_service_files(config_path, args.purge)?;
 
     println!("Service '{}' stopped and removed", name);
     println!(

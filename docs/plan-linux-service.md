@@ -18,9 +18,9 @@ sudo rathole-x service uninstall [--name <N>]
 - 已安装服务拒绝 `service install --config <path>`：任意路径无法被 `start`、`stop`、`upgrade` 与 `uninstall --all` 一致发现。请省略 `--config` 并以 `--name <N>` 使用唯一的 `/etc/rathole-x/<N>.toml` 托管配置；前台 `run --config` 仍可使用任意路径。
 - 权限模型：
   - `service install` 幂等地创建固定的不可登录系统账号/组 `rathole-x`；若管理员预先创建了该账号则保留原账号，卸载也绝不删除它。
-  - `/etc/rathole-x` 为 `root:rathole-x` `0750`；每个 TOML 和 `version.toml` 为 `root:rathole-x` `0640`。root 负责生命周期、配置原子替换和热重载；daemon 仅以组权限读取自己的配置。
+  - `/etc/rathole-x` 为 `root:rathole-x` `0755`；每个 TOML 和 `version.toml` 为 `root:rathole-x` `0644`，普通用户可读（与 Windows `status` 免提权读取配置的行为一致；token 在 `status` 输出中本就可见）。root 负责生命周期、配置原子替换和热重载；daemon 读取自己的配置。
   - `service install --allow-user-config` 在 Linux 托管服务中明确拒绝。原子替换必须创建并重命名临时文件，给编辑者父目录写权限会允许其替换或删除其他托管配置，不能以宽松 ACL 规避。
-  - `/usr/local/lib/rathole-x/rathole-x` 始终为 root:root `0755`；OpenRC root supervisor 持有 `/run` pid 和 `/var/log` 输出，daemon 不获得这些目录写权限。
+  - `/usr/local/lib/rathole-x/rathole-x` 始终为 root:root `0755`；OpenRC root supervisor 持有 `/run` pid；daemon 的日志文件 `/var/log/<svc>.log` 由 install 预创建为 `rathole-x:rathole-x` `0640`（daemon 只写自己的日志文件，不获得 `/var/log` 目录写权限）。
   - systemd 只以 `CAP_NET_BIND_SERVICE`（并使用 `CapabilityBoundingSet`、`AmbientCapabilities`、`NoNewPrivileges`）支持低端口；OpenRC 只配置同一 capability。其他网络权限来自普通非 root socket 能力。
   - CLI 侧判定逻辑在 `config_edit::writable_by_current_user` + `platform` 的权限流程。
 - 版本契约：多服务模型：`service install server|client --name <N>` 每服务一个配置文件（`/etc/rathole-x/<N>.toml`），服务名 `rathole-x-<role>-<N>`；`version.toml` 由 `service install` 写入 `version = <大版本>`；`config add/set/remove` 在大版本不匹配时拒绝执行（`config_edit::check_version_compat`），修复方式是重装服务；只读命令与 `service install/uninstall` 不受限。**开发规则：任何破坏性配置 schema 变更（改/删字段、改语义或默认值）必须升大版本**；纯新增可选字段（带 serde default）不要求。版本戳放 version.toml 而非主配置，保证主配置文件仍可被上游 rathole 解析。
