@@ -508,7 +508,21 @@ fn service_state_for(name: &str, config_path: &Path) -> Option<(String, Option<u
         })?;
         query_named_service(role.key(), name)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        let role = std::fs::read_to_string(config_path)
+            .ok()
+            .and_then(|c| toml::from_str::<Config>(&c).ok())
+            .map(|c| {
+                if c.client.is_some() {
+                    crate::config_edit::ServiceRole::Client
+                } else {
+                    crate::config_edit::ServiceRole::Server
+                }
+            })?;
+        crate::platform::query_service_state(role.key(), name)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = (name, config_path);
         None
@@ -545,7 +559,9 @@ pub fn run_status(args: &StatusArgs) -> Result<Value> {
         .map(|(name, role)| {
             #[cfg(windows)]
             let svc = query_named_service(role.key(), name);
-            #[cfg(not(windows))]
+            #[cfg(target_os = "linux")]
+            let svc = crate::platform::query_service_state(role.key(), name);
+            #[cfg(not(any(windows, target_os = "linux")))]
             let svc: Option<(String, Option<u32>)> = None;
             let config_path = crate::config_edit::config_dir().join(format!("{}.toml", name));
             let (runtime, runtime_snapshot, runtime_unavailable) = runtime_status_for(&config_path);
@@ -577,7 +593,9 @@ pub fn run_status(args: &StatusArgs) -> Result<Value> {
             for ((name, role), detail) in services.iter().zip(&arr) {
                 #[cfg(windows)]
                 let svc = query_named_service(role.key(), name);
-                #[cfg(not(windows))]
+                #[cfg(target_os = "linux")]
+                let svc = crate::platform::query_service_state(role.key(), name);
+                #[cfg(not(any(windows, target_os = "linux")))]
                 let svc: Option<(String, Option<u32>)> = None;
                 let state = match &svc {
                     Some((s, Some(pid))) => format!("{} (pid {})", s, pid),

@@ -65,6 +65,10 @@ MAINPID=$(systemctl show -p MainPID --value "$UNIT")
     || fail "relay owner: want rathole-x, got $(stat -c '%U' /proc/"$MAINPID")"
 grep -q 'NoNewPrivs:.*1' /proc/"$MAINPID"/status || fail "NoNewPrivs not set on the relay"
 echo "relay pid $MAINPID runs as rathole-x with NoNewPrivs: OK"
+/usr/local/bin/rathole-x status --name "$NAME" | grep -q "Running" \
+    || fail "status does not report the installed service as Running"
+/usr/local/bin/rathole-x status | grep -q Running \
+    || fail "status list does not report the service as Running"
 
 echo "=== enabled for boot ==="
 systemctl is-enabled --quiet "$UNIT" || fail "unit not enabled for boot"
