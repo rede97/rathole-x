@@ -337,13 +337,14 @@ pub struct UninstallArgs {
 
     /// Also delete the configuration file
     ///
-    /// Without --purge the network config is kept; version.toml is removed
-    /// with the last service either way.
-    #[clap(long, conflicts_with = "all")]
+    /// With --all this makes the full removal explicit: every service and
+    /// every config. Without --all/--purge the network config is kept;
+    /// version.toml is removed with the last service either way.
+    #[clap(long)]
     pub purge: bool,
 
-    /// Remove EVERY installed service, their configs and the shared binary
-    #[clap(long, conflicts_with_all = &["name", "config", "purge"])]
+    /// Remove EVERY installed service; with --purge also remove their configs
+    #[clap(long, conflicts_with_all = &["name", "config"])]
     pub all: bool,
 
     /// Print the result as a single JSON object
@@ -728,7 +729,7 @@ mod tests {
             "--purge",
             "--yes",
         ])
-        .is_err());
+        .is_ok());
     }
 
     #[test]

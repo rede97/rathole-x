@@ -79,7 +79,7 @@ rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://g
 
 - `rathole-x service start|stop|restart [--name N | --all]` — 驱动已安装服务的 SCM 状态（需要时 UAC 提权）。
 - `rathole-x upgrade --yes` — 原地更新已安装的二进制：停止所有服务、用当前运行的二进制替换共享二进制、再重新启动它们。
-- `rathole-x service uninstall --yes --all` — 移除所有已安装服务、全部配置与共享二进制。
+- `rathole-x service uninstall --yes --all` — 移除所有已安装服务与共享二进制，但保留配置；加 `--purge` 才同时删除全部配置。
 - 常规的 `service uninstall --yes` 会保留可被用户删除的配置；而卸载一个已移除的服务会在**不提权**的情况下清理残留文件。
 
 ## Config schema versioning
@@ -180,7 +180,7 @@ Windows 上，`status` 还会查询由规范化配置路径派生、受 ACL 保�
 - `status [-c] [--name N] [--json]` — 打印服务状态与配置树；无参数列出全部服务，`--name N` 查看单服务，`--json` 供脚本使用。
 - `genkey [--curve x25519|x448]` — 生成 noise 密钥对。
 - `service install <server|client> --yes [-c] [--name N] [--allow-user-config]` — 安装系统服务（二选一角色）：缺失时创建角色骨架配置、将二进制复制到配置旁、写入 `uninstall-<N>.bat`，并以 UAC 注册 Windows SCM 服务（AutoStart）。`--name` 缺省为 "default"。交互式确认后运行；`--yes` 跳过确认（非交互 shell 必传）。
-- `service uninstall --yes [--name N] [-c] [--purge] [--all]` — 卸载命名服务；`--all` 全量清除（所有服务、全部配置与共享二进制）；最后一个服务被移除时 `version.toml` 一并删除，除非 `--purge`，否则配置保留。
+- `service uninstall --yes [--name N] [-c] [--purge] [--all]` — 卸载命名服务；`--all` 移除所有已安装服务与共享二进制但保留配置，`--all --purge` 同时删除全部配置；最后一个服务被移除时 `version.toml` 一并删除。
 - `service start|stop|restart [--name N | --all]` — 驱动已安装服务的 SCM 状态（需要时 UAC 提权）。
 - `upgrade --yes` — 原地更新已安装的二进制：停止所有服务、用当前运行的二进制替换共享二进制、再重新启动它们。
 

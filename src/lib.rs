@@ -338,8 +338,9 @@ fn dispatch_service_command(cmd: cli::ServiceCmd) -> Result<Value> {
                     u.json,
                     "uninstall",
                     &format!(
-                        "Remove EVERY installed rathole-x service ({}), their configs and the shared binary. Proceed?",
-                        if names.is_empty() { "none".to_owned() } else { names.join(", ") }
+                        "Remove EVERY installed rathole-x service ({}){} and the shared binary. Proceed?",
+                        if names.is_empty() { "none".to_owned() } else { names.join(", ") },
+                        if u.purge { ", every config" } else { ", keeping configs" }
                     ),
                 )?;
                 platform::uninstall_all(&u)?;
@@ -347,6 +348,7 @@ fn dispatch_service_command(cmd: cli::ServiceCmd) -> Result<Value> {
                     "action": "uninstall",
                     "names": names,
                     "all": true,
+                    "purge": u.purge,
                     "message": "all services uninstalled",
                 }));
             }

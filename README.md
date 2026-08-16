@@ -81,7 +81,7 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 
 - `rathole-x service start|stop|restart [--name N | --all]` — drive the SCM state of installed services (UAC elevated when needed).
 - `rathole-x upgrade --yes` — update the installed binary in place: stops every service, replaces the shared binary with the running one, starts them again.
-- `rathole-x service uninstall --yes --all` — remove every installed service, all configs and the shared binary.
+- `rathole-x service uninstall --yes --all` — remove every installed service and the shared binary while keeping configs; add `--purge` to remove every config too.
 - A normal `service uninstall --yes` leaves the kept config user-deletable, and uninstalling an already-removed service cleans leftover files WITHOUT elevation.
 
 ## Config schema versioning
@@ -130,7 +130,7 @@ On Windows, `status` also queries an ACL-protected **local-only, read-only** nam
 - `status [-c] [--name N] [--json]` — print the service state plus the config tree; without `--name` every installed service is listed.
 - `genkey [--curve x25519|x448]` — generate a noise keypair.
 - `service install <server|client> --yes [-c] [--name N] [--allow-user-config]` — install a system service (exactly one role): creates a role skeleton config if missing, copies the binary next to the config, writes `uninstall-<N>.bat`, and registers a Windows SCM service (AutoStart) with UAC. `--name` defaults to "default". Runs after an interactive confirmation; `--yes` skips it (required in unattended/JSON invocations).
-- `service uninstall --yes [--name N] [-c] [--purge] [--all]` — uninstall the named service; `--all` removes every installed service, all configs and the shared binary. `version.toml` is removed with the last service and the config is kept unless `--purge`.
+- `service uninstall --yes [--name N] [-c] [--purge] [--all]` — uninstall the named service; `--all` removes every installed service and the shared binary while keeping configs, and `--all --purge` removes every config as well. `version.toml` is removed with the last service.
 - `service start|stop|restart [--name N | --all]` — drive the SCM state of installed services (UAC elevated when needed).
 - `upgrade --yes` — stop every service, replace the shared binary with the running one, start them again.
 

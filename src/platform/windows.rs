@@ -1380,9 +1380,9 @@ pub fn uninstall_service(args: &UninstallArgs, config_path: &Path) -> Result<()>
     Ok(())
 }
 
-/// `rathole-x service uninstall --all`: remove every installed service, every
-/// config, the leftover uninstall bats and the shared binary.
-pub fn uninstall_all(_args: &UninstallArgs) -> Result<()> {
+/// `rathole-x service uninstall --all`: remove every installed service and
+/// the shared binary. `--purge` additionally removes every service config.
+pub fn uninstall_all(args: &UninstallArgs) -> Result<()> {
     let services = crate::config_edit::list_installed_services()?;
     if services.is_empty() {
         println!("No installed services to remove.");
@@ -1407,9 +1407,14 @@ pub fn uninstall_all(_args: &UninstallArgs) -> Result<()> {
         if exists {
             // uninstall() itself also falls back to the other role when the
             // primary SCM name does not open.
-            uninstall(&path, true)?;
+            uninstall(&path, args.purge)?;
         } else {
-            remove_service_files(&path, true);
+            remove_service_files(&path, args.purge);
+        }
+        if !args.purge {
+            // Match single-service uninstall: a kept config stays user-owned
+            // and deletable after the protected service is gone.
+            grant_users_modify(&path);
         }
         removed += 1;
     }
@@ -1427,9 +1432,10 @@ pub fn uninstall_all(_args: &UninstallArgs) -> Result<()> {
         }
     }
     println!(
-        "Removed {} service(s) and the shared files in {}.",
+        "Removed {} service(s) and the shared binary in {} (configs {}).",
         removed,
-        dir.display()
+        dir.display(),
+        if args.purge { "removed" } else { "kept" }
     );
     Ok(())
 }
