@@ -206,25 +206,20 @@ pub(crate) fn uninstall_service(args: &UninstallArgs, config_path: &Path) -> Res
         }
         None => {
             println!(
-                "Service '{}' is not installed; removing leftover files without root.",
+                "Service '{}' is not installed; cleaning up leftover files.",
                 name
             );
         }
     }
 
-    super::remove_service_files(config_path, args.purge);
-    if !args.purge {
-        // Leave the kept config owned by the invoking user so they can edit
-        // or delete it without sudo.
-        super::chown_to_sudo_user(config_path);
-    }
+    super::remove_service_files(config_path, args.purge)?;
 
     println!("Service '{}' stopped and removed", name);
     if args.purge {
         println!("  Config:      removed ({})", config_path.display());
     } else {
         println!(
-            "  Config:      kept (user-owned) ({})",
+            "  Config:      kept (delete with sudo or rerun with --purge) ({})",
             config_path.display()
         );
     }

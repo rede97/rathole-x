@@ -113,9 +113,13 @@ pub(crate) fn secure_managed_config(path: &Path) -> Result<()> {
         .parent()
         .ok_or_else(|| anyhow::anyhow!("config path has no parent"))?;
     std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
-    owner(dir, "0750")?;
+    // World-listable directory and world-readable configs (0755/0644),
+    // matching the Windows `status` readability contract and normal /etc
+    // conventions: configs carry no secrets worth hiding from local users
+    // (tokens are per-service and visible in `status` output anyway).
+    owner(dir, "0755")?;
     if path.exists() {
-        owner(path, "0640")?;
+        owner(path, "0644")?;
     }
     Ok(())
 }
@@ -144,9 +148,13 @@ pub(crate) fn deploy_binary() -> Result<PathBuf> {
     command_ok("chmod", &["0755", INSTALLED_BINARY])?;
     Ok(dest)
 }
-pub(crate) fn remove_service_files(config: &Path, purge: bool) {
-    if purge {
-        let _ = std::fs::remove_file(config);
+pub(crate) fn remove_service_files(config: &Path, purge: bool) -> Result<()> {
+    if purge && config.exists() {
+        // Deleting a root-owned config requires root; fail loudly instead
+        // of claiming the config was removed.
+        ensure_root()?;
+        std::fs::remove_file(config)
+            .with_context(|| format!("failed to remove config {}", config.display()))?;
     }
     let version = config_edit::version_path(config);
     let others = config
@@ -158,11 +166,12 @@ pub(crate) fn remove_service_files(config: &Path, purge: bool) {
                 .any(|e| e.path().extension().is_some_and(|x| x == "toml") && e.path() != version)
         })
         .unwrap_or(false);
-    if !others {
-        let _ = std::fs::remove_file(version);
+    if !others && version.exists() {
+        std::fs::remove_file(&version)
+            .with_context(|| format!("failed to remove version stamp {}", version.display()))?;
     }
+    Ok(())
 }
-pub(crate) fn chown_to_sudo_user(_path: &Path) {}
 
 pub fn install_service(
     args: &InstallArgs,
