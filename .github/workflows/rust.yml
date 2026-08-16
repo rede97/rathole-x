@@ -2,15 +2,12 @@ name: Rust
 
 on:
   workflow_dispatch:
-
   pull_request:
     branches: ["*"]
   push:
     branches: ["main", "dev"]
 
 concurrency:
-  # Documentation suggests ${{ github.head_ref }}, but that's only available on pull_request/pull_request_target triggers, so using ${{ github.ref }}.
-  # On main, we want all builds to complete even if merging happens faster to make it easier to discover at which point something broke.
   group: ${{ github.ref == 'refs/heads/main' && format('ci-main-{0}', github.sha) || format('ci-{0}', github.ref) }}
   cancel-in-progress: true
 
@@ -37,35 +34,64 @@ jobs:
           --mutually-exclusive-features default,native-tls,websocket-native-tls,rustls,websocket-rustls
 
   build:
-    name: Build for ${{ matrix.target }}
+    name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            exe: rathole-x
-            target: x86_64-unknown-linux-gnu
           - os: windows-latest
-            exe: rathole-x.exe
+            target: i686-pc-windows-msvc
+            build: cargo
+            cross: false
+            native_test: false
+          - os: windows-latest
             target: x86_64-pc-windows-msvc
-          - os: macos-latest
-            exe: rathole-x
-            target: x86_64-apple-darwin
-          - os: macos-latest
-            exe: rathole-x
-            target: aarch64-apple-darwin
-
+            build: cargo
+            cross: false
+            native_test: true
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            build: cargo
+            cross: false
+            native_test: false
+          - os: ubuntu-latest
+            target: i686-unknown-linux-musl
+            build: cross
+            cross: true
+            native_test: false
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            build: cross
+            cross: true
+            native_test: true
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-musleabihf
+            build: cross
+            cross: true
+            native_test: false
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            build: cross
+            cross: true
+            native_test: false
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build
-        run: cargo build
-      - name: Run tests with native-tls
-        run: cargo test --verbose
-      - name: Run tests with rustls
-        run: cargo test --verbose --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
-      - uses: actions/upload-artifact@v4
         with:
-          name: rathole-x-${{ matrix.target }}
-          path: target/debug/${{ matrix.exe }}
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        if: matrix.cross
+        with:
+          tool: cross
+      - uses: Swatinem/rust-cache@v2
+      - name: Run native-tls tests
+        if: matrix.native_test
+        run: ${{ matrix.build }} test --locked --target ${{ matrix.target }} --verbose
+      - name: Run rustls tests
+        if: matrix.native_test
+        run: >
+          ${{ matrix.build }} test --locked --target ${{ matrix.target }} --verbose
+          --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
+      - name: Compile target
+        run: ${{ matrix.build }} build --locked --target ${{ matrix.target }}

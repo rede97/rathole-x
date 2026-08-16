@@ -34,8 +34,8 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 - **Single-role execution** — a config containing both sections must be run explicitly with `run --server` or `run --client`; normal deployment uses two independently configured processes.
 - **Auto-generated tokens and noise keys** — `config add`/`config set` generate them when omitted.
 - **Hot reload via atomic writes** — `config add`/`config set`/`config remove` rewrite the config atomically; the running service hot-reloads it without a restart.
-- **Windows service install** — `service install server|client --name <n>` registers a named SCM service (AutoStart) with its own config file; the binary is copied next to the configs and is not replaceable by non-admins; an `uninstall-<n>.bat` is written per service; whether non-admin users may edit a config is decided by its actual permissions (no policy file).
-- **Status tree view** — `status` prints the service state plus the config tree (`--name N` for a single service, `--json` for scripts).
+- **Windows service install** — `service install server|client --name <n>` registers a named AutoStart SCM service that runs as `NT AUTHORITY\LocalService`, with a **restricted per-service SID** and only `SeChangeNotifyPrivilege`; never LocalSystem. The shared protected binary is read/execute-only to each installed `NT SERVICE\rathole-x-<role>-<n>` SID. Each service gets a distinct protected log directory; its config is read-only to its own SID, while Administrators and SYSTEM retain lifecycle control. `--allow-user-config` is rejected for managed services because atomic config replacement cannot safely expose the shared config directory; normal uninstall retains the protected secret config.
+- **Linux systemd / OpenRC service install** — the same `service install server|client --name <n>` works on both init systems (detected at runtime): systemd gets a boot-enabled restricted non-root unit; OpenRC distros (Alpine, Gentoo) get an openrc-run script that runs the daemon as `rathole-x` via `command_args_foreground`, with root retaining only supervisor/pid/log lifecycle duties. Both allow low ports only through `CAP_NET_BIND_SERVICE`.
 - **Role skeleton auto-creation** — `service install` creates a role-specific skeleton config when none exists.
 
 ## Quick start (Windows)
@@ -76,7 +76,7 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 ```
 
 > **Linux systemd** service support is planned — see [docs/plan-linux-service.md](docs/plan-linux-service.md).
-
+> **Linux systemd / OpenRC**: run the same commands under `sudo` (`sudo rathole-x service install server --yes --name relay`). systemd writes, enables and starts `rathole-x-server-relay.service`; OpenRC (Alpine, Gentoo) writes `/etc/init.d/rathole-x-server-relay` and registers it through `rc-update add default`. Both run the protected root:root `0755` binary at `/usr/local/lib/rathole-x/rathole-x` as the dedicated non-login `rathole-x:rathole-x` account, never root. `/etc/rathole-x` is root:rathole-x `0750`; configs and `version.toml` are root:rathole-x `0640`, so secrets remain unreadable outside root and the daemon group. Root manages config atomically and hot reloads it; `--allow-user-config` is deliberately rejected because a safe atomic replacement needs directory mutation. systemd and OpenRC grant only `CAP_NET_BIND_SERVICE` for configured low ports; systemd also bounds the capability and enables `NoNewPrivileges`. OpenRC's root supervisor owns its pid and `/var/log` output. Normal uninstall retains that protected config; it never removes a pre-existing administrator-provisioned `rathole-x` account. Installed services always use this named managed-config layout: `service install --config …` is rejected; use `--name`. Linux has no self-elevation: non-root runs fail with `please run with sudo`. See [docs/plan-linux-service.md](docs/plan-linux-service.md).
 ## Service lifecycle
 
 - `rathole-x service start|stop|restart [--name N | --all]` — drive the SCM state of installed services (UAC elevated when needed).
@@ -87,18 +87,18 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 ## Config schema versioning
 
 The `version.toml` file (written by `service install`) stamps the **major version** of the rathole-x build that installed the service. `config add`/`config set`/`config remove` refuse to touch a config whose stamped major version differs from the running CLI:
+On Docker hosts, skip the init system entirely: Docker is the lifecycle manager (`restart` = crash respawn, the daemon = boot autostart, `docker stop` sends SIGTERM). The image **does not start or call systemd/OpenRC**. Its entrypoint does only the minimal mounted-config ownership initialization, then `exec`s foreground `rathole-x run` as non-root `rathole-x`; Docker manages the process and the daemon hot-reloads the mounted config.
 
+```bash
+docker build -t rathole-x .
+docker run -d --name rathole-x -v rathole-x-conf:/etc/rathole-x --restart unless-stopped rathole-x
+# The container starts empty and hibernates until a config exists. Bootstrap
+# the mounted volume atomically; this needs neither TOML editing nor an init:
+docker exec rathole-x rathole-x config set -c /etc/rathole-x/rathole-x.toml --client --remote-addr myserver.com:2333
+docker exec rathole-x rathole-x config add -c /etc/rathole-x/rathole-x.toml myssh --local-addr 172.17.0.1:22
 ```
-This config is managed by rathole-x v0 but this CLI is v1.
-Reinstall the service to upgrade: `rathole-x service uninstall --yes` then `rathole-x service install <server|client> --yes`.
-```
 
-Read-only commands (`status`, `list`, `run`) and `install`/`uninstall` are never blocked. Configs without a policy file (user-managed files) have no stamp and no restriction.
-
-**Rule for developers: any breaking config schema change (renamed/removed/retagged fields, changed semantics or defaults) MUST bump the major version.** Purely additive changes (new optional fields with serde defaults) do not require one. The stamp lives in `version.toml`, so the rathole config file itself stays 100% parseable by upstream rathole.
-
-## Runtime connection status
-
+A ready-made [docker-compose.yml](examples/docker/docker-compose.yml) lives under `examples/docker/`. Client mode usually wants `network_mode: host` (or a `local` addr reachable from the container, like the docker bridge `172.17.0.1`); server mode can publish ports instead.
 On Windows, `status` also queries an ACL-protected local named pipe derived from the canonical config path. The `runtime` field is a local snapshot, not a network probe: it includes schema version, role, process ID and capture time; client services report `connecting`, `connected`, `retrying`, or `stopped` plus configured/resolved **control target** and connection/error times; server services report `waiting`, `connected`, or `stopped` plus the authenticated control-channel source and connection/disconnect metadata. It never exposes tokens, keys, payloads, or traffic.
 
 `runtime: null` is normal when the process is stopped, uses an old binary or another config, or has not created its endpoint yet; `runtime_availability.reason` explains it without failing the static status result. Linux/systemd endpoint support is planned.
@@ -115,7 +115,7 @@ On Windows, `status` also queries an ACL-protected local named pipe derived from
 - `status [-c] [--name N] [--json]` — print the service state plus the config tree; without `--name` every installed service is listed.
 - `genkey [--curve x25519|x448]` — generate a noise keypair.
 - `service install <server|client> --yes [-c] [--name N] [--allow-user-config]` — install a system service (exactly one role): creates a role skeleton config if missing, copies the binary next to the config, writes `uninstall-<N>.bat`, and registers a Windows SCM service (AutoStart) with UAC. `--name` defaults to "default". Runs after an interactive confirmation; `--yes` skips it (required in non-interactive shells).
-- `service uninstall --yes [--name N] [-c] [--purge] [--all]` — uninstall the named service; `--all` removes every installed service, all configs and the shared binary. `version.toml` is removed with the last service and the config is kept unless `--purge`.
+On Windows, `status` also queries an ACL-protected **local-only, read-only** named pipe derived from the canonical config path. Authenticated local callers may request one bounded snapshot; remote clients are rejected, and the endpoint never exposes tokens, keys, payloads, or traffic. It reports schema version, role, PID, capture time and connection state only.
 - `service start|stop|restart [--name N | --all]` — drive the SCM state of installed services (UAC elevated when needed).
 - `upgrade --yes` — stop every service, replace the shared binary with the running one, start them again.
 
@@ -130,7 +130,7 @@ On Windows, `status` also queries an ACL-protected local named pipe derived from
 - [rathole](#rathole)
   - [Features](#features)
   - [Quickstart](#quickstart)
-  - [Configuration](#configuration)
+- `service install <server|client> --yes [--name N] [--allow-user-config]` — install a named, single-role system service using the managed `<config-dir>/<N>.toml` layout (`--config` is rejected so lifecycle commands can always discover it). Windows copies the binary beside its configs and registers an SCM service with UAC; Linux deploys a root-owned binary at `/usr/local/lib/rathole-x/rathole-x` and writes a systemd unit or OpenRC script under `sudo`. `--name` defaults to "default"; managed Windows and Linux services reject `--allow-user-config` so the config directory stays protected during atomic replacement.
     - [Logging](#logging)
     - [Tuning](#tuning)
   - [Benchmark](#benchmark)
@@ -208,9 +208,6 @@ A full-powered `rathole` can be obtained from the [release](https://github.com/r
 
 The usage of `rathole` is very similar to frp. If you have experience with the latter, then the configuration is very easy for you. The only difference is that configuration of a service is split into the client side and the server side, and a token is mandatory.
 
-To use `rathole`, you need a server with a public IP, and a device behind the NAT, where some services that need to be exposed to the Internet.
-
-Assuming you have a NAS at home behind the NAT, and want to expose its ssh service to the Internet:
 
 1. On the server which has a public IP
 

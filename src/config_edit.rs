@@ -365,6 +365,15 @@ pub fn ensure_role_config(path: &Path, role: ServiceRole) -> Result<bool> {
 fn write_atomic(path: &Path, content: &str) -> Result<()> {
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     std::fs::write(&tmp, content).with_context(|| format!("Failed to write {}", tmp.display()))?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Managed Linux configs can contain credentials. Restrict the
+        // replacement before its name becomes visible at the destination.
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o640))
+            .with_context(|| format!("Failed to secure {}", tmp.display()))?;
+    }
     #[cfg(windows)]
     let replace = crate::platform::replace_file_preserving_security(&tmp, path);
     #[cfg(not(windows))]

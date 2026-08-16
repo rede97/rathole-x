@@ -1,0 +1,33 @@
+# rathole-x as a Docker service (Alpine image, see the repo Dockerfile).
+#
+# Docker IS the lifecycle manager here: it starts the container, `restart`
+# handles crashes, and `docker compose stop` sends SIGTERM. The image does not
+# run or call systemd/OpenRC. Its entrypoint performs only initial ownership
+# setup for the mounted config directory, then execs foreground
+# `rathole-x run` as the unprivileged rathole-x account.
+#
+# Usage (the commands create the mounted config atomically; no handwritten
+# TOML or system init is required):
+#   mkdir -p conf
+#   docker compose up -d
+#   docker compose exec rathole-x rathole-x config set -c /etc/rathole-x/rathole-x.toml \
+#     --client --remote-addr YOUR.SERVER:2333
+#   docker compose exec rathole-x rathole-x config add -c /etc/rathole-x/rathole-x.toml \
+#     myssh --local-addr 172.17.0.1:22
+services:
+  rathole-x:
+    build: ../..
+    image: rathole-x
+    container_name: rathole-x
+    restart: unless-stopped
+    volumes:
+      - ./conf:/etc/rathole-x
+    # Client mode usually needs to reach services on the docker host or LAN:
+    # uncomment to share the host network stack (then `local` can be
+    # 127.0.0.1). Server mode (bind_addr 0.0.0.0) can also just publish ports
+    # instead.
+    # network_mode: host
+    # Alternatively, publish server-side ports:
+    # ports:
+    #   - "2333:2333"
+    #   - "5202:5202"
