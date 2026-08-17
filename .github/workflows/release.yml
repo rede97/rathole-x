@@ -36,6 +36,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        # One cache per target: the default key is shared across the matrix,
+        # and target/ holds host build-script binaries that are only runnable
+        # in the cross image that compiled them (glibc baselines differ).
+        with:
+          key: ${{ matrix.target }}
       - name: Run native tests
         if: matrix.native_test
         run: cargo test --locked --release --target ${{ matrix.target }} --verbose
@@ -77,6 +82,11 @@ jobs:
         with:
           tool: cross
       - uses: Swatinem/rust-cache@v2
+        # One cache per target: the default key is shared across the matrix,
+        # and target/ holds host build-script binaries that are only runnable
+        # in the cross image that compiled them (glibc baselines differ).
+        with:
+          key: ${{ matrix.target }}
       # Linux musl ships rustls-only: native-tls would need a target OpenSSL
       # sysroot per architecture. The rustls feature set is the same one the
       # Docker image and acceptance tests use.

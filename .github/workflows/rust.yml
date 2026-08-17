@@ -92,6 +92,11 @@ jobs:
         with:
           tool: cross
       - uses: Swatinem/rust-cache@v2
+        # One cache per target: the default key is shared across the matrix,
+        # and target/ holds host build-script binaries that are only runnable
+        # in the cross image that compiled them (glibc baselines differ).
+        with:
+          key: ${{ matrix.target }}
       # Linux musl builds are rustls-only: native-tls cannot find a target
       # OpenSSL sysroot in cross containers. Windows legs keep default
       # features (Schannel has no external dependency).
