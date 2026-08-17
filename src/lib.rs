@@ -175,6 +175,7 @@ fn command_requests_json(cmd: &Commands) -> bool {
             cli::ConfigCmd::Remove(a) => a.json,
             cli::ConfigCmd::List(a) => a.json,
             cli::ConfigCmd::Set(a) => a.json,
+            cli::ConfigCmd::Import(a) => a.json,
         },
         Commands::Status(a) => a.json,
         Commands::Service { cmd } => match cmd {
@@ -257,6 +258,14 @@ async fn dispatch_config_command(cmd: cli::ConfigCmd) -> Result<Value> {
                 return Ok(json!({"relayed": true}));
             }
             config_edit::run_set(&s, &path)
+        }
+        Import(i) => {
+            let path = config_edit::resolve_service_config(i.config.as_ref(), i.name.as_deref())?;
+            config_edit::check_version_compat(&path)?;
+            if platform::elevate_for_config_if_needed(&path)? {
+                return Ok(json!({"relayed": true}));
+            }
+            config_edit::run_import(&i, &path)
         }
     }
 }

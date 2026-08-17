@@ -47,7 +47,7 @@ In every scenario the same secure-by-default tooling does the work: `service ins
 
 ## New features over upstream
 
-- **Subcommand-driven CLI** — `run` (run the daemon), `config add|remove|list|set` (manage the service configuration), `status` (service state + config tree), `genkey` (generate a noise keypair), `service install|uninstall|start|stop|restart` (system service lifecycle), `upgrade` (update the installed binary). See [CLI reference](#cli-reference) for flags.
+- **Subcommand-driven CLI** — `run` (run the daemon), `config add|remove|list|set|import` (manage the service configuration, or migrate an old config file in), `status` (service state + config tree), `genkey` (generate a noise keypair), `service install|uninstall|start|stop|restart` (system service lifecycle), `upgrade` (update the installed binary). See [CLI reference](#cli-reference) for flags.
 - **Single-role execution** — a config containing both sections must be run explicitly with `run --server` or `run --client`; normal deployment uses two independently configured processes.
 - **Auto-generated tokens and noise keys** — `config add`/`config set` generate them when omitted.
 - **Hot reload via atomic writes** — `config add`/`config set`/`config remove` rewrite the config atomically; the running service hot-reloads it without a restart.
@@ -203,6 +203,11 @@ The `rathole-x` binary is fully subcommand-based; running it bare prints the hel
 # Inspect and edit the config it maintains
 ./rathole-x config list -c config.toml
 ./rathole-x config remove my_nas_ssh -c config.toml
+
+# Migrate an upstream rathole / old rathole-x config file: supported fields
+# and services are copied in, existing entries are never overwritten, and
+# unknown keys are reported as ignored.
+./rathole-x config import old.toml --name home-nas
 
 # --json writes exactly one envelope to stdout:
 # {"ok":true,"result":...} or {"ok":false,"error":{"message":"..."}}.

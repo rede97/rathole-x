@@ -143,6 +143,20 @@ token for every service lacking its own, use
 `config set -c <config> --default-token <value> --yes`. Transfer tokens only
 through a secure channel.
 
+Migrating an existing upstream rathole or older rathole-x config file into a
+managed one needs no manual TOML either:
+
+```bash
+sudo rathole-x config import /path/to/old.toml -c /etc/rathole-x/<n>.toml --json
+```
+
+The import is additive and non-destructive: supported global fields,
+transport settings and service entries are copied; entries already present
+in the target are skipped (never overwritten); unknown keys are reported
+under `ignored`; entries with a missing address or unusable token are
+reported under `skipped.invalid_services` with a reason. The old file must
+declare exactly one of `[client]`/`[server]`, matching the target's role.
+
 ### 4. Verify
 
 ```bash

@@ -11,7 +11,8 @@ use serde_json::{json, Map, Value};
 use toml_edit::{value, DocumentMut, Item, Table, TableLike};
 
 use crate::cli::{
-    AddArgs, KeypairType, ListArgs, RemoveArgs, ServiceTypeArg, SetArgs, TransportTypeArg,
+    AddArgs, ImportArgs, KeypairType, ListArgs, RemoveArgs, ServiceTypeArg, SetArgs,
+    TransportTypeArg,
 };
 
 const DEFAULT_SERVER_BIND_ADDR: &str = "0.0.0.0:2333";
@@ -801,6 +802,446 @@ pub fn run_set(args: &SetArgs, path: &Path) -> Result<Value> {
         println!("Updated [{}] in {}", section_key, path.display());
         if let Some((_, public)) = &generated_noise {
             println!("Noise public key (share with clients): {}", public);
+        }
+    }
+    Ok(result)
+}
+
+/// Scalar kinds a whitelisted key may carry; a source value of a different
+/// kind is reported as ignored instead of failing the whole import.
+#[derive(Clone, Copy)]
+enum ScalarKind {
+    Str,
+    Int,
+    Bool,
+}
+
+impl ScalarKind {
+    fn matches(self, item: &Item) -> bool {
+        matches!(
+            (self, item),
+            (ScalarKind::Str, Item::Value(toml_edit::Value::String(_)))
+                | (ScalarKind::Int, Item::Value(toml_edit::Value::Integer(_)))
+                | (ScalarKind::Bool, Item::Value(toml_edit::Value::Boolean(_)))
+        )
+    }
+}
+
+/// Whitelisted `[client]` / `[server]` global fields accepted from an old
+/// config, in copy order. Everything else at that level is reported ignored.
+const CLIENT_IMPORT_GLOBALS: &[(&str, ScalarKind)] = &[
+    ("remote_addr", ScalarKind::Str),
+    ("default_token", ScalarKind::Str),
+    ("prefer_ipv6", ScalarKind::Bool),
+    ("heartbeat_timeout", ScalarKind::Int),
+    ("retry_interval", ScalarKind::Int),
+];
+const SERVER_IMPORT_GLOBALS: &[(&str, ScalarKind)] = &[
+    ("bind_addr", ScalarKind::Str),
+    ("default_token", ScalarKind::Str),
+    ("heartbeat_interval", ScalarKind::Int),
+];
+const TRANSPORT_IMPORT_KEYS: &[&str] = &["type", "tcp", "tls", "noise", "websocket"];
+const TCP_IMPORT_KEYS: &[(&str, ScalarKind)] = &[
+    ("nodelay", ScalarKind::Bool),
+    ("keepalive_secs", ScalarKind::Int),
+    ("keepalive_interval", ScalarKind::Int),
+    ("proxy", ScalarKind::Str),
+];
+const TLS_IMPORT_KEYS: &[(&str, ScalarKind)] = &[
+    ("hostname", ScalarKind::Str),
+    ("trusted_root", ScalarKind::Str),
+    ("pkcs12", ScalarKind::Str),
+    ("pkcs12_password", ScalarKind::Str),
+];
+const NOISE_IMPORT_KEYS: &[(&str, ScalarKind)] = &[
+    ("pattern", ScalarKind::Str),
+    ("local_private_key", ScalarKind::Str),
+    ("remote_public_key", ScalarKind::Str),
+];
+const WEBSOCKET_IMPORT_KEYS: &[(&str, ScalarKind)] = &[("tls", ScalarKind::Bool)];
+/// `[client.services.<name>]` / `[server.services.<name>]` fields. The map
+/// key supplies the name; the schema's `name` field is serde-skipped.
+const CLIENT_SERVICE_IMPORT_KEYS: &[(&str, ScalarKind)] = &[
+    ("type", ScalarKind::Str),
+    ("local_addr", ScalarKind::Str),
+    ("token", ScalarKind::Str),
+    ("nodelay", ScalarKind::Bool),
+    ("retry_interval", ScalarKind::Int),
+    ("prefer_ipv6", ScalarKind::Bool),
+];
+const SERVER_SERVICE_IMPORT_KEYS: &[(&str, ScalarKind)] = &[
+    ("type", ScalarKind::Str),
+    ("bind_addr", ScalarKind::Str),
+    ("token", ScalarKind::Str),
+    ("nodelay", ScalarKind::Bool),
+];
+
+fn transport_import_subkeys(key: &str) -> Option<&'static [(&'static str, ScalarKind)]> {
+    match key {
+        "tcp" => Some(TCP_IMPORT_KEYS),
+        "tls" => Some(TLS_IMPORT_KEYS),
+        "noise" => Some(NOISE_IMPORT_KEYS),
+        "websocket" => Some(WEBSOCKET_IMPORT_KEYS),
+        _ => None,
+    }
+}
+
+/// `config import <old-config>`: copy the supported subset of an old
+/// (upstream rathole or older rathole-x) config into the target config.
+///
+/// Semantics, all or nothing with one atomic write at the end:
+/// - the old file must declare exactly one role and the target config's role
+///   must match (a fresh target adopts the source role);
+/// - whitelisted global fields and the transport table are applied
+///   (overwrite) per-key; values of the wrong shape are reported ignored;
+/// - service entries are inserted in source order; an entry whose name
+///   already exists in the target is skipped, and an entry with a missing/
+///   invalid address, unknown `type`, or no usable token is skipped with a
+///   per-entry reason;
+/// - unknown keys at every level are collected into the `ignored` report.
+pub fn run_import(args: &ImportArgs, path: &Path) -> Result<Value> {
+    let source = &args.source;
+    let src_content = std::fs::read_to_string(source)
+        .with_context(|| format!("Failed to read old config {}", source.display()))?;
+    let src = src_content
+        .parse::<DocumentMut>()
+        .with_context(|| format!("Failed to parse old config {}", source.display()))?;
+
+    // A dual-section old file is ambiguous: detect_role renders the
+    // standard split guidance.
+    let role =
+        detect_role(&src).with_context(|| format!("invalid old config {}", source.display()))?;
+    let side = match role {
+        ServiceRole::Client => ServiceSide::Client,
+        ServiceRole::Server => ServiceSide::Server,
+    };
+    let section_key = side.key();
+    let src_section = src
+        .get(section_key)
+        .and_then(Item::as_table_like)
+        .ok_or_else(|| anyhow!("[{}] is not a table in {}", section_key, source.display()))?;
+
+    let created = ensure_config_skeleton(path)?;
+    let mut doc = if created {
+        DocumentMut::new()
+    } else {
+        load_document(path)?
+    };
+    ensure_role_allows(&doc, side).with_context(|| {
+        format!(
+            "cannot import a {} config into {}",
+            role.key(),
+            path.display()
+        )
+    })?;
+
+    let addr_key = match side {
+        ServiceSide::Client => "remote_addr",
+        ServiceSide::Server => "bind_addr",
+    };
+    // A fresh target section can only be created when the old config
+    // supplies the control-channel address.
+    if doc.get(section_key).is_none() {
+        if src_section.get(addr_key).and_then(Item::as_str).is_none() {
+            bail!(
+                "old config has no [{}].{}; cannot create the [{}] section in {}",
+                section_key,
+                addr_key,
+                section_key,
+                path.display()
+            );
+        }
+        let mut section = Table::new();
+        section.insert("services", Item::Table(Table::new()));
+        doc[section_key] = Item::Table(section);
+    }
+
+    let mut applied_fields: Vec<String> = Vec::new();
+    let mut applied_transport = false;
+    let mut applied_services: Vec<String> = Vec::new();
+    let mut skipped_existing: Vec<String> = Vec::new();
+    let mut skipped_invalid: Vec<(String, String)> = Vec::new();
+    let mut ignored: Vec<String> = Vec::new();
+
+    let globals = match side {
+        ServiceSide::Client => CLIENT_IMPORT_GLOBALS,
+        ServiceSide::Server => SERVER_IMPORT_GLOBALS,
+    };
+
+    // Global scalar fields.
+    {
+        let section = doc[section_key]
+            .as_table_like_mut()
+            .ok_or_else(|| anyhow!("[{}] is not a table in {}", section_key, path.display()))?;
+        for (key, kind) in globals {
+            let Some(item) = src_section.get(key) else { continue };
+            if !kind.matches(item) {
+                ignored.push(format!("{section_key}.{key} (unexpected value type)"));
+                continue;
+            }
+            let reject = match (section_key, *key) {
+                (_, "remote_addr" | "bind_addr") => validate_host_port(
+                    item.as_str().expect("kind checked above"),
+                    key,
+                )
+                .err()
+                .map(|e| e.to_string()),
+                (_, "default_token") if item.as_str().map(str::is_empty).unwrap_or(true) => {
+                    Some("empty token".to_string())
+                }
+                ("client", "retry_interval")
+                    if item.as_integer().is_none_or(|v| v <= 0) =>
+                {
+                    Some("must be greater than 0".to_string())
+                }
+                (_, _) if matches!(kind, ScalarKind::Int) => item
+                    .as_integer()
+                    .filter(|v| *v < 0)
+                    .map(|_| "negative value".to_string()),
+                _ => None,
+            };
+            if let Some(reason) = reject {
+                ignored.push(format!("{section_key}.{key} ({reason})"));
+                continue;
+            }
+            section.insert(key, item.clone());
+            applied_fields.push((*key).to_string());
+        }
+    }
+    // Unknown keys at the section level: not imported, reported.
+    for (k, _) in src_section.iter() {
+        if !globals.iter().any(|(kk, _)| kk == &k) && k != "transport" && k != "services" {
+            ignored.push(format!("{section_key}.{k}"));
+        }
+    }
+
+    // Transport table.
+    if let Some(t_item) = src_section.get("transport") {
+        match t_item.as_table_like() {
+            None => ignored.push(format!("{section_key}.transport (not a table)")),
+            Some(t_src) => {
+                applied_transport = true;
+                let section = doc[section_key]
+                    .as_table_like_mut()
+                    .ok_or_else(|| anyhow!("[{}] is not a table in {}", section_key, path.display()))?;
+                let transport = ensure_table(section, "transport", path)?;
+                for (k, _) in t_src.iter() {
+                    if !TRANSPORT_IMPORT_KEYS.contains(&k) {
+                        ignored.push(format!("{section_key}.transport.{k}"));
+                    }
+                }
+                if let Some(ty) = t_src.get("type") {
+                    match ty.as_str() {
+                        Some(s @ ("tcp" | "tls" | "noise" | "websocket")) => {
+                            transport.insert("type", value(s));
+                        }
+                        Some(other) => ignored
+                            .push(format!("{section_key}.transport.type (unknown type `{other}`)")),
+                        None => ignored.push(format!("{section_key}.transport.type (not a string)")),
+                    }
+                }
+                for sub in ["tcp", "tls", "noise", "websocket"] {
+                    let Some(sub_src) = t_src.get(sub) else { continue };
+                    let Some(sub_src) = sub_src.as_table_like() else {
+                        ignored.push(format!("{section_key}.transport.{sub} (not a table)"));
+                        continue;
+                    };
+                    let keys = transport_import_subkeys(sub).expect("sub key list");
+                    let sub_dst = ensure_table(transport, sub, path)?;
+                    for (k, _) in sub_src.iter() {
+                        if !keys.iter().any(|(kk, _)| kk == &k) {
+                            ignored.push(format!("{section_key}.transport.{sub}.{k}"));
+                        }
+                    }
+                    for (k, kind) in keys {
+                        let Some(item) = sub_src.get(k) else { continue };
+                        if !kind.matches(item) {
+                            ignored.push(format!(
+                                "{section_key}.transport.{sub}.{k} (unexpected value type)"
+                            ));
+                            continue;
+                        }
+                        sub_dst.insert(k, item.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Service entries.
+    let existing: Vec<String> = doc
+        .get(section_key)
+        .and_then(|s| s.get("services"))
+        .and_then(Item::as_table_like)
+        .map(|t| t.iter().map(|(k, _)| k.to_string()).collect())
+        .unwrap_or_default();
+    let default_token_present = doc
+        .get(section_key)
+        .and_then(|s| s.get("default_token"))
+        .and_then(Item::as_str)
+        .is_some_and(|t| !t.is_empty());
+
+    if let Some(svcs_item) = src_section.get("services") {
+        match svcs_item.as_table_like() {
+            None => ignored.push(format!("{section_key}.services (not a table)")),
+            Some(svcs_src) => {
+                let svc_keys = match side {
+                    ServiceSide::Client => CLIENT_SERVICE_IMPORT_KEYS,
+                    ServiceSide::Server => SERVER_SERVICE_IMPORT_KEYS,
+                };
+                let svc_addr_key = if side == ServiceSide::Client {
+                    "local_addr"
+                } else {
+                    "bind_addr"
+                };
+                let section = doc[section_key]
+                    .as_table_like_mut()
+                    .ok_or_else(|| anyhow!("[{}] is not a table in {}", section_key, path.display()))?;
+                let services = ensure_table(section, "services", path)?;
+                for (name, entry_item) in svcs_src.iter() {
+                    if existing.iter().any(|n| n == name) {
+                        skipped_existing.push(name.to_string());
+                        continue;
+                    }
+                    if let Err(e) = validate_service_name(name) {
+                        skipped_invalid.push((name.to_string(), e.to_string()));
+                        continue;
+                    }
+                    let Some(entry_src) = entry_item.as_table_like() else {
+                        skipped_invalid.push((name.to_string(), "entry is not a table".to_string()));
+                        continue;
+                    };
+                    for (k, _) in entry_src.iter() {
+                        if !svc_keys.iter().any(|(kk, _)| kk == &k) {
+                            ignored.push(format!("{section_key}.services.{name}.{k}"));
+                        }
+                    }
+                    let mut entry = Table::new();
+                    if let Some(ty) = entry_src.get("type") {
+                        match ty.as_str() {
+                            Some(s @ ("tcp" | "udp")) => {
+                                entry.insert("type", value(s));
+                            }
+                            Some(other) => {
+                                skipped_invalid.push((
+                                    name.to_string(),
+                                    format!("unknown service type `{other}`"),
+                                ));
+                                continue;
+                            }
+                            None => {
+                                skipped_invalid.push((
+                                    name.to_string(),
+                                    "service type is not a string".to_string(),
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+                    let addr = entry_src.get(svc_addr_key).and_then(Item::as_str);
+                    match addr {
+                        Some(a) if validate_host_port(a, svc_addr_key).is_ok() => {
+                            entry.insert(svc_addr_key, value(a));
+                        }
+                        _ => {
+                            skipped_invalid.push((
+                                name.to_string(),
+                                format!("missing or invalid {svc_addr_key}"),
+                            ));
+                            continue;
+                        }
+                    }
+                    match entry_src.get("token") {
+                        Some(t) => match t.as_str() {
+                            Some(t) if !t.is_empty() => {
+                                entry.insert("token", value(t));
+                            }
+                            _ => {
+                                skipped_invalid.push((
+                                    name.to_string(),
+                                    "token is not a non-empty string".to_string(),
+                                ));
+                                continue;
+                            }
+                        },
+                        None => {
+                            if !default_token_present {
+                                skipped_invalid.push((
+                                    name.to_string(),
+                                    "no token and no default_token available".to_string(),
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+                    for (k, kind) in svc_keys {
+                        if matches!(*k, "type" | "local_addr" | "bind_addr" | "token") {
+                            continue;
+                        }
+                        let Some(item) = entry_src.get(k) else { continue };
+                        if !kind.matches(item) {
+                            ignored.push(format!(
+                                "{section_key}.services.{name}.{k} (unexpected value type)"
+                            ));
+                            continue;
+                        }
+                        entry.insert(k, item.clone());
+                    }
+                    services.insert(name, Item::Table(entry));
+                    applied_services.push(name.to_string());
+                }
+            }
+        }
+    }
+
+    save_with_skeleton(path, &doc, created)?;
+
+    let invalid_json: Vec<Value> = skipped_invalid
+        .iter()
+        .map(|(n, r)| json!({"name": n, "reason": r}))
+        .collect();
+    let result = json!({
+        "action": "import",
+        "source": source,
+        "side": side.key(),
+        "applied": {
+            "fields": applied_fields,
+            "transport": applied_transport,
+            "services": applied_services,
+        },
+        "skipped": {
+            "existing_services": skipped_existing,
+            "invalid_services": invalid_json,
+        },
+        "ignored": ignored,
+        "created": created,
+    });
+    if !args.json {
+        println!(
+            "Imported from {} into [{}] of {}",
+            source.display(),
+            section_key,
+            path.display()
+        );
+        if !applied_fields.is_empty() {
+            println!("  fields: {}", applied_fields.join(", "));
+        }
+        if applied_transport {
+            println!("  transport: applied");
+        }
+        if !applied_services.is_empty() {
+            println!("  services added: {}", applied_services.join(", "));
+        }
+        if !skipped_existing.is_empty() {
+            println!("  skipped existing: {}", skipped_existing.join(", "));
+        }
+        if !skipped_invalid.is_empty() {
+            let names: Vec<String> = skipped_invalid.iter().map(|(n, _)| n.clone()).collect();
+            println!("  skipped invalid: {}", names.join(", "));
+        }
+        if !ignored.is_empty() {
+            println!("  ignored keys: {}", ignored.join(", "));
         }
     }
     Ok(result)
@@ -1768,6 +2209,221 @@ mod tests {
         assert!(ensure_role_config(&path, ServiceRole::Server).is_err());
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn import_client_config_applies_supported_fields() {
+        let dir =
+            std::env::temp_dir().join(format!("rathole-x-import-client-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("new.toml");
+        let source = dir.join("old.toml");
+        std::fs::write(
+            &source,
+            r#"
+[client]
+remote_addr = "203.0.113.9:2333"
+retry_interval = 7
+default_token = "fallback-token"
+mystery_field = 1
+
+[client.transport]
+type = "tcp"
+[client.transport.tcp]
+nodelay = false
+mystery_tcp = true
+
+[client.services.web]
+local_addr = "127.0.0.1:8080"
+token = "web-token"
+nodelay = true
+weird = 42
+
+[client.services.udp_svc]
+type = "udp"
+local_addr = "127.0.0.1:5353"
+"#,
+        )
+        .unwrap();
+
+        let args = ImportArgs {
+            source: source.clone(),
+            config: Some(target.clone()),
+            name: None,
+            json: true,
+        };
+        let result = run_import(&args, &target).expect("import succeeds");
+
+        assert_eq!(result["side"], "client");
+        let fields: Vec<&str> = result["applied"]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(fields.contains(&"remote_addr"));
+        assert!(fields.contains(&"retry_interval"));
+        assert!(fields.contains(&"default_token"));
+        assert!(result["applied"]["transport"].as_bool().unwrap());
+        assert_eq!(result["applied"]["services"], json!(["web", "udp_svc"]));
+        let ignored: Vec<&str> = result["ignored"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(ignored.contains(&"client.mystery_field"), "{ignored:?}");
+        assert!(ignored.contains(&"client.transport.tcp.mystery_tcp"), "{ignored:?}");
+        assert!(ignored.contains(&"client.services.web.weird"), "{ignored:?}");
+
+        // The written file parses and carries the imported values.
+        let written = std::fs::read_to_string(&target).unwrap();
+        let cfg: crate::config::Config = toml::from_str(&written).unwrap();
+        let client = cfg.client.unwrap();
+        assert_eq!(client.remote_addr, "203.0.113.9:2333");
+        assert_eq!(client.retry_interval, 7);
+        assert!(!client.transport.tcp.nodelay);
+        let web = client.services.get("web").unwrap();
+        assert_eq!(web.local_addr, "127.0.0.1:8080");
+        assert_eq!(web.nodelay, Some(true));
+        let udp = client.services.get("udp_svc").unwrap();
+        assert_eq!(udp.service_type, crate::config::ServiceType::Udp);
+        // udp_svc carries no token; the imported default_token covers it.
+        assert_eq!(udp.token, None);
+
+        // A second import is a no-op for entries: all reported existing.
+        let result2 = run_import(&args, &target).expect("second import succeeds");
+        assert_eq!(
+            result2["skipped"]["existing_services"],
+            json!(["web", "udp_svc"])
+        );
+        assert!(result2["applied"]["services"].as_array().unwrap().is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn import_reports_skipped_existing_and_invalid_entries() {
+        let dir =
+            std::env::temp_dir().join(format!("rathole-x-import-skip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.toml");
+        std::fs::write(
+            &target,
+            "[client]\nremote_addr = \"127.0.0.1:2333\"\n\n[client.services.keep]\nlocal_addr = \"127.0.0.1:9000\"\ntoken = \"t\"\n",
+        )
+        .unwrap();
+        let source = dir.join("old.toml");
+        std::fs::write(
+            &source,
+            r#"
+[client]
+remote_addr = "203.0.113.9:2333"
+
+[client.services.keep]
+local_addr = "127.0.0.1:1"
+token = "t"
+
+[client.services.noaddr]
+token = "t"
+
+[client.services.notoken]
+local_addr = "127.0.0.1:2"
+
+[client.services.badtype]
+type = "quic"
+local_addr = "127.0.0.1:3"
+token = "t"
+"#,
+        )
+        .unwrap();
+
+        let args = ImportArgs {
+            source,
+            config: Some(target.clone()),
+            name: None,
+            json: true,
+        };
+        let result = run_import(&args, &target).expect("import succeeds");
+
+        assert_eq!(result["skipped"]["existing_services"], json!(["keep"]));
+        let invalid: Vec<&str> = result["skipped"]["invalid_services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(invalid, ["noaddr", "notoken", "badtype"]);
+        assert!(result["applied"]["services"].as_array().unwrap().is_empty());
+
+        // The pre-existing entry is untouched.
+        let written = std::fs::read_to_string(&target).unwrap();
+        let cfg: crate::config::Config = toml::from_str(&written).unwrap();
+        let keep = cfg.client.unwrap().services.get("keep").unwrap().clone();
+        assert_eq!(keep.local_addr, "127.0.0.1:9000");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn import_rejects_role_mismatch_and_dual_section_source() {
+        let dir =
+            std::env::temp_dir().join(format!("rathole-x-import-role-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let client_target = dir.join("client.toml");
+        std::fs::write(
+            &client_target,
+            "[client]\nremote_addr = \"127.0.0.1:2333\"\n\n[client.services]\n",
+        )
+        .unwrap();
+        let server_source = dir.join("server-old.toml");
+        std::fs::write(
+            &server_source,
+            "[server]\nbind_addr = \"0.0.0.0:2333\"\n\n[server.services.web]\nbind_addr = \"0.0.0.0:8080\"\ntoken = \"t\"\n",
+        )
+        .unwrap();
+
+        let args = ImportArgs {
+            source: server_source.clone(),
+            config: Some(client_target.clone()),
+            name: None,
+            json: true,
+        };
+        let err = run_import(&args, &client_target).expect_err("role mismatch");
+        assert!(format!("{err:#}").contains("server config"), "{err:#}");
+
+        let dual = dir.join("dual.toml");
+        std::fs::write(
+            &dual,
+            "[client]\nremote_addr = \"127.0.0.1:1\"\n[client.services]\n[server]\nbind_addr = \"0.0.0.0:1\"\n[server.services]\n",
+        )
+        .unwrap();
+        let args2 = ImportArgs {
+            source: dual,
+            config: Some(client_target.clone()),
+            name: None,
+            json: true,
+        };
+        assert!(run_import(&args2, &client_target).is_err());
+
+        // Happy path: server import into a fresh target.
+        let server_target = dir.join("server.toml");
+        let args3 = ImportArgs {
+            source: server_source,
+            config: Some(server_target.clone()),
+            name: None,
+            json: true,
+        };
+        let result = run_import(&args3, &server_target).expect("server import");
+        assert_eq!(result["side"], "server");
+        assert_eq!(result["applied"]["services"], json!(["web"]));
+        let cfg: crate::config::Config =
+            toml::from_str(&std::fs::read_to_string(&server_target).unwrap()).unwrap();
+        let server = cfg.server.unwrap();
+        assert_eq!(server.bind_addr, "0.0.0.0:2333");
+        assert_eq!(server.services.get("web").unwrap().bind_addr, "0.0.0.0:8080");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -111,6 +111,9 @@ pub enum ConfigCmd {
 
     /// Update global fields of the [client] or [server] section
     Set(Box<SetArgs>),
+
+    /// Import supported fields and services from an old config file
+    Import(ImportArgs),
 }
 
 #[derive(Args, Debug, Clone, Default)]
@@ -239,6 +242,29 @@ pub struct AddArgs {
     #[clap(long)]
     pub yes: bool,
 }
+#[derive(Args, Debug, Clone, Default)]
+pub struct ImportArgs {
+    /// Path of the old configuration file to import supported fields and
+    /// services from (upstream rathole or an older rathole-x config).
+    /// Unknown keys are skipped and reported; existing service entries are
+    /// never overwritten; the target config's role must match.
+    #[clap(value_name = "OLD_CONFIG", parse(from_os_str))]
+    pub source: PathBuf,
+
+    /// The path to the configuration file (import target)
+    #[clap(parse(from_os_str), short, long, conflicts_with = "name")]
+    pub config: Option<PathBuf>,
+
+    /// Short name of the installed service the operation targets. When
+    /// omitted and exactly one service is installed, that one is used
+    #[clap(long)]
+    pub name: Option<String>,
+
+    /// Print the result as a single JSON object
+    #[clap(long)]
+    pub json: bool,
+}
+
 #[derive(Args, Debug, Clone, Default)]
 pub struct RemoveArgs {
     /// Name of the service entry to remove

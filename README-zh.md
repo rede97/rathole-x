@@ -46,7 +46,7 @@ rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://g
 
 ## New features over upstream
 
-- **子命令驱动的 CLI** — `run`（运行守护进程）、`config add|remove|list|set`（管理服务配置）、`status`（服务状态 + 配置树）、`genkey`（生成 noise 密钥对）、`service install|uninstall|start|stop|restart`（系统服务生命周期）、`upgrade`（更新已安装二进制）。各 flag 见 [CLI reference](#cli-reference)。
+- **子命令驱动的 CLI** — `run`（运行守护进程）、`config add|remove|list|set|import`（管理服务配置，或从旧配置文件迁移）、`status`（服务状态 + 配置树）、`genkey`（生成 noise 密钥对）、`service install|uninstall|start|stop|restart`（系统服务生命周期）、`upgrade`（更新已安装二进制）。各 flag 见 [CLI reference](#cli-reference)。
 - **单角色执行** — 同时含 `[server]` 与 `[client]` 的手写配置必须显式使用 `run --server` 或 `run --client`；常规部署使用两个独立配置的进程。
 - **自动生成 token 与 noise 密钥** — `config add`/`config set` 在省略时自动生成。
 - **原子写入热重载** — `config add`/`config set`/`config remove` 原子重写配置；运行中的服务无需重启即热重载。
@@ -155,6 +155,10 @@ Windows 上，`status` 还会查询由规范化配置路径派生、受 ACL 保�
 # 查看并编辑其维护的配置
 ./rathole-x config list -c config.toml
 ./rathole-x config remove my_nas_ssh -c config.toml
+
+# 迁移上游 rathole / 旧 rathole-x 配置文件：受支持的字段与服务会被复制
+# 进来；已存在的条目不会被覆盖；未知键会在 ignored 中列出。
+./rathole-x config import old.toml --name home-nas
 
 # 当缺少 flag 且存在 TTY 时使用交互式提示；
 # 脚本可传入所有 flag 并通过 --json 读取机器可读输出。

@@ -8,7 +8,7 @@ Non-negotiable product rules:
 
 - Keep `src/protocol.rs` byte/wire compatible with upstream. Do not change bincode message shapes, digests, packet lengths, or protocol versioning for management features.
 - One process runs one role. A config containing both `[client]` and `[server]` requires explicit `run --client` or `run --server`; normal deployment uses separate configs/processes.
-- Manage configs through `service install` and `config add|set|remove`; do not hand-write or partially write config files from code.
+- Manage configs through `service install` and `config add|set|remove|import`; do not hand-write or partially write config files from code.
 - `--json` commands emit one stdout envelope: `{ "ok": true, "result": ... }` or `{ "ok": false, "error": { "message": ... } }`. Unattended destructive commands require `--yes`.
 - Windows service support is implemented. Linux service support (systemd and OpenRC) is implemented; `docs/linux-service.md` is the frozen design baseline.
 
