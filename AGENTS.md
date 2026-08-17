@@ -43,6 +43,7 @@ main.rs
 | `examples/` | Upstream-style sample configs and TLS demo material; do not treat sample secrets/keys as production-safe. |
 | `docs/` | Upstream documentation plus fork-specific plans/audits. Label planned or inherited material accurately. |
 | `scripts/` | Release helper scripts. |
+| `skills/` | Agent-consumable skills (e.g. `rathole-x-config` for CLI-driven configuration workflows). |
 | `.github/workflows/` | Rust CI and Windows release workflow. |
 
 ## Development Commands
