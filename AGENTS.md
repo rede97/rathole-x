@@ -112,7 +112,7 @@ On Windows, stop an installed service before commands that relink `target/debug/
 - `build.rs` intentionally uses vergen without its git feature because native libgit2 is problematic on MSVC.
 - `cargo fmt` follows `.rustfmt.toml`; stable may warn that `imports_granularity = "module"` is nightly-only.
 - `service upgrade` requires UAC for protected installed binaries: stop services, replace the shared binary, reapply ACLs, then restart services.
-- Local Windows release: `./scripts/release.sh <TAG>` requires Bash, PowerShell, and `gh`; it builds `x86_64-pc-windows-msvc` and creates a draft release for `rede97/rathole-x`.
+- Releases are CI-only: pushing a `v*` tag runs `.github/workflows/release.yml`, which builds the Windows (MSVC) and Linux (musl/rustls) artifacts and publishes them for `rede97/rathole-x`. Do not build Windows binaries from Linux locally.
 
 ## Testing & QA
 
