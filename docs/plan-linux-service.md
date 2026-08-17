@@ -27,7 +27,7 @@ sudo rathole-x service uninstall [--name <N>]
 - 已实现的原则沿用：每个 daemon 或已安装服务进程只承载一个角色。配置同时含 `[server]` 和 `[client]` 时，前台 `run` 必须明确使用 `--server` 或 `--client`；双角色需求使用两个独立配置和进程。
 
 - 自动化契约：`config add/remove/list/set`、`status`、服务生命周期与 `upgrade` 的 `--json` stdout 严格输出一个 `{ok,result}` 或 `{ok:false,error:{message}}` 封套；确认型操作在无人值守或 JSON 情况必须使用 `--yes`，否则非零失败，绝不打印用法后成功退出。
-- 运行时状态端点：Windows 当前以规范化配置路径派生的 ACL 本地命名管道提供只读快照；Linux 实现时为每个 unit 提供等价的本地、访问受控端点（不得增加 daemon 网络监听），使 `status` 的 `runtime` 字段一致。端点缺失必须表示 `runtime: null` 与可操作原因，而非让 SCM/配置状态查询失败。
+- 运行时状态端点：Windows 以规范化配置路径派生的 ACL 本地命名管道提供只读快照；Linux 已实现等价端点——同一派生名称的 abstract namespace Unix socket（无文件系统路径与残留生命周期，本地任意用户可连接，不增加 daemon 网络监听），`status` 的 `runtime` 字段两平台一致。端点缺失表示为 `runtime: null` 与可操作原因，而非让服务/配置状态查询失败。
 
 ## 文件布局
 

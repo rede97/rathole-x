@@ -29,7 +29,7 @@ main.rs
 - `src/lib.rs` owns dispatch, JSON envelopes, confirmation policy, run supervision, and `determine_run_mode`.
 - `src/config_watcher.rs` emits `ConfigChange::General` for section/non-service changes (restart only the instance generation) and per-service Add/Delete events for live application. Invalid rescans retain the prior config.
 - Client control channels authenticate per service; server control channels are keyed by service digest. Data channels are created on demand. The server uses TCP pool size 8 and UDP pool size 1.
-- `src/runtime_status.rs` is a local management plane, not proxy protocol. It tracks client/server control channels and listener state. Windows exposes snapshots through an ACL-protected named pipe derived from the canonical config path; `status` merges that snapshot with SCM and static config data. Read-only status must work without UAC; installed directories/configs are user-readable but only admin-writable unless `--allow-user-config`, and status must distinguish `readable`/`missing`/`denied` instead of collapsing access errors to missing.
+- `src/runtime_status.rs` is a local management plane, not proxy protocol. It tracks client/server control channels and listener state. Windows exposes snapshots through an ACL-protected named pipe derived from the canonical config path; Linux binds an abstract-namespace Unix socket under the same derived name (no filesystem path, connectable by any local user); `status` merges that snapshot with SCM/init and static config data. Read-only status must work without UAC/root; installed directories/configs are user-readable but only admin-writable unless `--allow-user-config`, and status must distinguish `readable`/`missing`/`denied` instead of collapsing access errors to missing.
 - Use the `src/platform.rs` façade. `src/platform/windows.rs` owns SCM, UAC, ACL, binary upgrade, and named-pipe code; `src/platform/other.rs` provides planned-platform stubs. Keep `lib.rs` and `main.rs` platform-cfg-free.
 
 ## Key Directories
@@ -66,8 +66,12 @@ CI also checks the feature powerset:
 
 ```bash
 cargo hack check --feature-powerset --no-dev-deps \
-  --mutually-exclusive-features default,native-tls,websocket-native-tls,rustls,websocket-rustls
+  --exclude-features default,native-tls,websocket-native-tls
 ```
+
+Linux CI standardizes on rustls (no system OpenSSL available); the native-tls backend is exercised by the Windows build legs, which keep default features.
+
+Cross-compiling and running tests for the musl/ARM release targets (including Raspberry Pi 3B 32-bit = `armv7-unknown-linux-musleabihf`) requires a one-time host toolchain setup: zig cc shims for musl linking, cross gcc for gnu targets, qemu-user binfmt registration, and `~/.cargo/config.toml` target/env entries. The full setup and the emulated-rootfs test recipe are documented in `docs/build-guide.md` ("Cross-compiling and Testing for ARM").
 
 On Windows, stop an installed service before commands that relink `target/debug/rathole-x.exe`; a running service can lock that executable. Do not stop a user service without permission.
 
