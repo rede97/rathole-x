@@ -84,7 +84,7 @@ rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://g
 ./rathole-x service uninstall --yes --name home-nas
 ```
 
-> **Linux systemd / OpenRC**：同样的命令须以 `sudo` 运行（`sudo rathole-x service install server --yes --name relay`）。systemd 写入、启用并启动 `rathole-x-server-relay.service`；OpenRC（Alpine、Gentoo）写入 `/etc/init.d/rathole-x-server-relay`，并通过 `rc-update add default` 注册。两者都以专用、不可登录的 `rathole-x:rathole-x` 账号而不是 root 运行受保护的 root:root `0755` `/usr/local/lib/rathole-x/rathole-x`。低端口只通过 `CAP_NET_BIND_SERVICE` 支持；Linux 不做自提权，非 root 运行会报 `please run with sudo`。见 [docs/plan-linux-service.md](docs/plan-linux-service.md)。
+> **Linux systemd / OpenRC**：同样的命令须以 `sudo` 运行（`sudo rathole-x service install server --yes --name relay`）。systemd 写入、启用并启动 `rathole-x-server-relay.service`；OpenRC（Alpine、Gentoo）写入 `/etc/init.d/rathole-x-server-relay`，并通过 `rc-update add default` 注册。两者都以专用、不可登录的 `rathole-x:rathole-x` 账号而不是 root 运行受保护的 root:root `0755` `/usr/local/lib/rathole-x/rathole-x`。低端口只通过 `CAP_NET_BIND_SERVICE` 支持；Linux 不做自提权，非 root 运行会报 `please run with sudo`。见 [docs/linux-service.md](docs/linux-service.md)。
 
 ## Service lifecycle
 
@@ -123,9 +123,9 @@ docker exec rathole-x rathole-x config add -c /etc/rathole-x/rathole-x.toml myss
 
 ## 运行时连接状态
 
-Windows 上，`status` 还会查询由规范化配置路径派生、受 ACL 保护的**仅本机、只读**命名管道。已认证的本地调用者最多请求一个有界快照，远程客户端被拒绝。`runtime` 是本机快照而非网络探测：包含 schema 版本、角色、进程 ID 与采集时间；client 服务包含 `connecting`、`connected`、`retrying` 或 `stopped`，以及已配置/已解析的**控制通道目标**和连接/错误时间；server 服务包含 `waiting`、`connected` 或 `stopped`，以及已认证控制通道的来源地址和连接/断开元数据。不会暴露 token、密钥、载荷或流量。
+Windows 上，`status` 还会查询由规范化配置路径派生、受 ACL 保护的**仅本机、只读**命名管道；Linux 上则连接同一派生名称的 abstract namespace Unix socket。两个平台上任何本地用户都可请求一个有界快照，均不新增网络监听，Windows 侧远程客户端由管道直接拒绝。`runtime` 是本机快照而非网络探测：包含 schema 版本、角色、进程 ID 与采集时间；client 服务包含 `connecting`、`connected`、`retrying` 或 `stopped`，以及已配置/已解析的**控制通道目标**和连接/错误时间；server 服务包含 `waiting`、`connected` 或 `stopped`，以及已认证控制通道的来源地址和连接/断开元数据。不会暴露 token、密钥、载荷或流量。
 
-进程已停止、仍是旧二进制、使用另一份配置或端点尚未就绪时，`runtime: null` 属于正常结果；`runtime_availability.reason` 给出原因而不会使静态状态查询失败。Linux/systemd 端点仍在计划中。
+进程已停止、仍是旧二进制、使用另一份配置或端点尚未就绪时，`runtime: null` 属于正常结果；`runtime_availability.reason` 给出原因而不会使静态状态查询失败。
 
 ## CLI quick start (rathole-x)
 

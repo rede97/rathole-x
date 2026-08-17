@@ -86,7 +86,7 @@ In every scenario the same secure-by-default tooling does the work: `service ins
 ./rathole-x service uninstall --yes --name home-nas
 ```
 
-> **Linux systemd / OpenRC**: run the same commands under `sudo` (`sudo rathole-x service install server --yes --name relay`). systemd writes, enables and starts `rathole-x-server-relay.service`; OpenRC (Alpine, Gentoo) writes `/etc/init.d/rathole-x-server-relay` and registers it through `rc-update add default`. Both run the protected root:root `0755` binary at `/usr/local/lib/rathole-x/rathole-x` as the dedicated non-login `rathole-x:rathole-x` account, never root. Linux has no self-elevation: non-root runs fail with `please run with sudo`. See [docs/plan-linux-service.md](docs/plan-linux-service.md).
+> **Linux systemd / OpenRC**: run the same commands under `sudo` (`sudo rathole-x service install server --yes --name relay`). systemd writes, enables and starts `rathole-x-server-relay.service`; OpenRC (Alpine, Gentoo) writes `/etc/init.d/rathole-x-server-relay` and registers it through `rc-update add default`. Both run the protected root:root `0755` binary at `/usr/local/lib/rathole-x/rathole-x` as the dedicated non-login `rathole-x:rathole-x` account, never root. Linux has no self-elevation: non-root runs fail with `please run with sudo`. See [docs/linux-service.md](docs/linux-service.md).
 
 ## Service lifecycle
 
@@ -125,9 +125,9 @@ A ready-made [docker-compose.yml](examples/docker/docker-compose.yml) lives unde
 
 ## Runtime connection status
 
-On Windows, `status` also queries an ACL-protected **local-only, read-only** named pipe derived from the canonical config path. Authenticated local callers may request one bounded snapshot; remote clients are rejected. The `runtime` field is a local snapshot, not a network probe: it includes schema version, role, process ID and capture time; client services report `connecting`, `connected`, `retrying`, or `stopped` plus configured/resolved **control target** and connection/error times; server services report `waiting`, `connected`, or `stopped` plus the authenticated control-channel source and connection/disconnect metadata. It never exposes tokens, keys, payloads, or traffic.
+On Windows, `status` also queries an ACL-protected **local-only, read-only** named pipe derived from the canonical config path; on Linux it connects to an abstract-namespace Unix socket under the same derived name. On both platforms any local user may request one bounded snapshot, no network listener is added, and Windows remote clients are rejected by the pipe. The `runtime` field is a local snapshot, not a network probe: it includes schema version, role, process ID and capture time; client services report `connecting`, `connected`, `retrying`, or `stopped` plus configured/resolved **control target** and connection/error times; server services report `waiting`, `connected`, or `stopped` plus the authenticated control-channel source and connection/disconnect metadata. It never exposes tokens, keys, payloads, or traffic.
 
-`runtime: null` is normal when the process is stopped, uses an old binary or another config, or has not created its endpoint yet; `runtime_availability.reason` explains it without failing the static status result. Linux/systemd endpoint support is planned.
+`runtime: null` is normal when the process is stopped, uses an old binary or another config, or has not created its endpoint yet; `runtime_availability.reason` explains it without failing the static status result.
 
 ## CLI reference
 
