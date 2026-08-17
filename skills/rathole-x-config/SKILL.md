@@ -28,6 +28,53 @@ applies changes without restarts.
 6. **Tokens are secrets.** Let the CLI auto-generate them; never invent weak
    ones, never echo them into logs or chat. Outputs mask them as `••••`.
 
+## Download the binary first (no manual browsing)
+
+The agent should download the release asset for the detected host
+architecture itself, verify it, and deploy it; never ask the user to find a
+download page. Project and release endpoint:
+
+- Repository: `https://github.com/rede97/rathole-x`
+- Latest release API: `https://api.github.com/repos/rede97/rathole-x/releases/latest`
+- Asset pattern: `rathole-x-<rust-target>.zip` on Windows and
+  `rathole-x-<rust-target>.tar.gz` on Linux.
+
+Supported release targets:
+
+| Host | Rust target | Asset |
+|---|---|---|
+| Windows x64 | `x86_64-pc-windows-msvc` | `rathole-x-x86_64-pc-windows-msvc.zip` |
+| Windows x86 | `i686-pc-windows-msvc` | `rathole-x-i686-pc-windows-msvc.zip` |
+| Windows ARM64 | `aarch64-pc-windows-msvc` | `rathole-x-aarch64-pc-windows-msvc.zip` |
+| Linux x86_64 | `x86_64-unknown-linux-musl` | `rathole-x-x86_64-unknown-linux-musl.tar.gz` |
+| Linux x86 | `i686-unknown-linux-musl` | `rathole-x-i686-unknown-linux-musl.tar.gz` |
+| Linux ARMv7 | `armv7-unknown-linux-musleabihf` | `rathole-x-armv7-unknown-linux-musleabihf.tar.gz` |
+| Linux ARM64 | `aarch64-unknown-linux-musl` | `rathole-x-aarch64-unknown-linux-musl.tar.gz` |
+
+Linux agent workflow (download a pinned release, verify, then deploy):
+
+```bash
+TAG=v0.5.4
+TARGET=$(case "$(uname -m)" in
+  x86_64) echo x86_64-unknown-linux-musl ;;
+  i686) echo i686-unknown-linux-musl ;;
+  armv7*|armhf) echo armv7-unknown-linux-musleabihf ;;
+  aarch64|arm64) echo aarch64-unknown-linux-musl ;;
+  *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac)
+curl -fL "https://github.com/rede97/rathole-x/releases/download/$TAG/rathole-x-$TARGET.tar.gz" -o /tmp/rathole-x.tar.gz
+tar -xzf /tmp/rathole-x.tar.gz -C /tmp
+/tmp/rathole-x --version
+```
+
+For the newest published release, resolve the tag through the GitHub API
+instead of guessing, then use the matching `browser_download_url` in the
+release response. Windows agents should use the matching `.zip`, expand it,
+and run `.\rathole-x.exe --version` before `service install`.
+
+If a release has no asset for the detected architecture, stop and report the
+missing target; do not substitute another architecture.
+
 ## Requirements to gather first
 
 - **Role**: is this host the public relay (`server`) or the NATed machine
