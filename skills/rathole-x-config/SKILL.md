@@ -54,7 +54,7 @@ Supported release targets:
 Linux agent workflow (download a pinned release, verify, then deploy):
 
 ```bash
-TAG=v0.5.4
+TAG=v0.5.5
 TARGET=$(case "$(uname -m)" in
   x86_64) echo x86_64-unknown-linux-musl ;;
   i686) echo i686-unknown-linux-musl ;;
