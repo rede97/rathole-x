@@ -1645,6 +1645,18 @@ pub fn upgrade_binary() -> Result<()> {
         .map(|(name, role)| scm_name(*role, name))
         .collect();
     let update_result = (|| -> Result<()> {
+        // Services installed before the least-privilege change have ACLs
+        // without any per-service SID grants; after the hardening migration
+        // above, such a service runs as LocalService + restricted SID and is
+        // DENIED its own config (degraded loop, no status endpoint) and log
+        // directory. Grant exactly the needed access, additively — existing
+        // ACLs and ownership stay untouched.
+        for (name, role) in &services {
+            grant_service_access(
+                &scm_name(*role, name),
+                &crate::config_edit::config_dir().join(format!("{}.toml", name)),
+            )?;
+        }
         ensure_binary_copy(&exe, &installed)?;
         // The replacement inherits the temp file's security descriptor;
         // re-apply the binary lockdown so an upgrade can never leave a
@@ -1758,6 +1770,48 @@ fn grant_users_modify(path: &Path) {
         ),
         Err(e) => warn!("failed to run icacls on {}: {}", path.display(), e),
     }
+}
+
+/// Additive icacls grants giving one service's virtual account exactly the
+/// filesystem access it needs: traverse the config directory, read its own
+/// config, write its own logs. Used by `upgrade_binary` after migrating a
+/// pre-hardening service to the restricted account. Additive (`/grant`
+/// only, no `/setowner`, no inheritance reset), so existing ACLs — including
+/// `--allow-user-config` grants — stay untouched.
+fn service_access_grant_args(service: &str, config: &Path) -> Vec<Vec<OsString>> {
+    let dir = config
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let logs = dir.join("logs");
+    [
+        (dir.to_path_buf(), "(OI)(CI)RX"),
+        (config.to_path_buf(), "(R)"),
+        (logs, "(OI)(CI)M"),
+    ]
+    .into_iter()
+    .map(|(path, perm)| {
+        vec![
+            path.as_os_str().to_os_string(),
+            OsString::from("/grant"),
+            service_account_grant(service, perm),
+        ]
+    })
+    .collect()
+}
+
+fn grant_service_access(service: &str, config: &Path) -> Result<()> {
+    // The log directory may not exist on pre-hardening installs (the old
+    // account created it at service start); create it while elevated so the
+    // restricted token never needs directory-creation rights.
+    if let Some(dir) = config.parent() {
+        std::fs::create_dir_all(dir.join("logs"))
+            .with_context(|| format!("failed to create log directory for {}", config.display()))?;
+    }
+    for args in service_access_grant_args(service, config) {
+        run_icacls(&args)?;
+    }
+    Ok(())
 }
 
 /// Elevate (UAC) before the caller writes `path`, when its auth policy
@@ -1980,6 +2034,142 @@ pub fn query_runtime_status(config_path: &Path) -> Result<RuntimeSnapshot> {
 mod tests {
 
     use super::*;
+
+    /// Regression probe for the hardened service account: a service running
+    /// as LocalService with a write-restricted per-service SID
+    /// (`sc sidtype restricted`) must still be able to create the runtime
+    /// status pipe. Simulates the SCM token shape: the current token plus a
+    /// service SID as a restricted SID, impersonated on this thread.
+    #[test]
+    fn restricted_service_token_can_create_status_pipe() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Security::{
+            CreateRestrictedToken, DuplicateTokenEx, LookupAccountNameW, RevertToSelf,
+            SecurityImpersonation, TokenImpersonation, SID_AND_ATTRIBUTES, SID_NAME_USE,
+            TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::SetThreadToken;
+
+        // "NT SERVICE\Schedule" (Task Scheduler) exists on every Windows
+        // machine, so its per-service SID always resolves.
+        let account: Vec<u16> = OsStr::new("NT SERVICE\\Schedule")
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let mut sid_buf = [0u8; 256];
+        let mut sid_len = sid_buf.len() as u32;
+        let mut domain_len = 0u32;
+        let mut name_use: SID_NAME_USE = 0;
+        let ok = unsafe {
+            LookupAccountNameW(
+                std::ptr::null(),
+                account.as_ptr(),
+                sid_buf.as_mut_ptr() as *mut _,
+                &mut sid_len,
+                std::ptr::null_mut(),
+                &mut domain_len,
+                &mut name_use,
+            )
+        };
+        if ok == 0 {
+            eprintln!("NT SERVICE\\Schedule not resolvable; skipping probe");
+            return;
+        }
+
+        unsafe {
+            let process = GetCurrentProcess();
+            let mut token: HANDLE = std::ptr::null_mut();
+            assert_ne!(
+                OpenProcessToken(process, TOKEN_DUPLICATE | TOKEN_QUERY, &mut token),
+                0,
+                "OpenProcessToken"
+            );
+            let mut impersonation: HANDLE = std::ptr::null_mut();
+            assert_ne!(
+                DuplicateTokenEx(
+                    token,
+                    TOKEN_IMPERSONATE | TOKEN_QUERY,
+                    std::ptr::null(),
+                    SecurityImpersonation,
+                    TokenImpersonation,
+                    &mut impersonation,
+                ),
+                0,
+                "DuplicateTokenEx"
+            );
+            let restrict = SID_AND_ATTRIBUTES {
+                Sid: sid_buf.as_ptr() as *mut _,
+                Attributes: 0,
+            };
+            let mut restricted: HANDLE = std::ptr::null_mut();
+            assert_ne!(
+                CreateRestrictedToken(
+                    impersonation,
+                    0,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    1,
+                    &restrict,
+                    &mut restricted,
+                ),
+                0,
+                "CreateRestrictedToken"
+            );
+            assert_ne!(
+                SetThreadToken(std::ptr::null(), restricted),
+                0,
+                "SetThreadToken"
+            );
+
+            // The exact pipe creation the service performs at startup.
+            let endpoint = crate::runtime_status::endpoint_for_config(
+                &std::env::temp_dir().join(format!(
+                    "rathole-x-restricted-probe-{}.toml",
+                    std::process::id()
+                )),
+            );
+            let result = create_status_pipe(&endpoint, true);
+
+            RevertToSelf();
+            CloseHandle(restricted);
+            CloseHandle(impersonation);
+            CloseHandle(token);
+
+            drop(result.expect(
+                "a write-restricted service token must be able to create the status pipe",
+            ));
+        }
+    }
+
+    /// The upgrade-time repair grants: exactly directory traverse, config
+    /// read and log write for the service's virtual account, additively.
+    #[test]
+    fn service_access_grants_cover_dir_config_and_logs() {
+        let config = Path::new(r"C:\ProgramData\rathole-x\demo.toml");
+        let cmds = service_access_grant_args("rathole-x-client-demo", config);
+        let render = |cmd: &[OsString]| {
+            cmd.iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert_eq!(cmds.len(), 3);
+        assert_eq!(
+            render(&cmds[0]),
+            r"C:\ProgramData\rathole-x /grant NT SERVICE\rathole-x-client-demo:(OI)(CI)RX"
+        );
+        assert_eq!(
+            render(&cmds[1]),
+            r"C:\ProgramData\rathole-x\demo.toml /grant NT SERVICE\rathole-x-client-demo:(R)"
+        );
+        assert_eq!(
+            render(&cmds[2]),
+            r"C:\ProgramData\rathole-x\logs /grant NT SERVICE\rathole-x-client-demo:(OI)(CI)M"
+        );
+    }
 
     #[test]
     fn binary_copy_skips_same_path_and_copies_elsewhere() {
