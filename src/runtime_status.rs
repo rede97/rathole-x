@@ -431,7 +431,7 @@ pub(crate) fn endpoint_for_config(config_path: &Path) -> String {
 
 #[cfg(any(windows, target_os = "linux", test))]
 fn canonical_config_path(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| {
         if path.is_absolute() {
             path.to_owned()
         } else {
@@ -439,7 +439,28 @@ fn canonical_config_path(path: &Path) -> PathBuf {
                 .map(|cwd| cwd.join(path))
                 .unwrap_or_else(|_| path.to_owned())
         }
-    })
+    });
+    strip_verbatim_prefix(&resolved)
+}
+
+/// `std::fs::canonicalize` on Windows returns verbatim `\\?\X\...` paths,
+/// while a process that cannot traverse the config directory (ACL-locked
+/// install dirs) falls back to the plain path — and the two spellings would
+/// derive different status endpoint names. Strip the verbatim prefix so the
+/// endpoint name is identical whether or not canonicalize succeeded.
+#[cfg(any(windows, target_os = "linux", test))]
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.as_os_str().to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{}", rest));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
 }
 
 #[cfg(test)]
@@ -489,6 +510,37 @@ mod tests {
         let path = std::env::temp_dir().join("rathole-x-runtime-status.toml");
         assert_eq!(endpoint_for_config(&path), endpoint_for_config(&path));
         assert!(endpoint_for_config(&path).starts_with(r"\\.\pipe\rathole-x-status-"));
+    }
+
+    /// The endpoint name must not depend on whether the caller can
+    /// canonicalize the config path: a verbatim `\\?\` prefix from a
+    /// successful canonicalize and the plain fallback path must derive the
+    /// same endpoint.
+    #[cfg(windows)]
+    #[test]
+    fn canonical_path_strips_verbatim_prefix() {
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\C:\ProgramData\rathole-x\default.toml")),
+            PathBuf::from(r"C:\ProgramData\rathole-x\default.toml")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\c.toml")),
+            PathBuf::from(r"\\server\share\c.toml")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"C:\plain\c.toml")),
+            PathBuf::from(r"C:\plain\c.toml")
+        );
+        // A real file: canonicalize succeeds here, so the derived path must
+        // already be prefix-free.
+        let real = std::env::temp_dir().join("rathole-x-prefix-test.toml");
+        std::fs::write(&real, b"x").unwrap();
+        let derived = canonical_config_path(&real);
+        assert!(!derived
+            .as_os_str()
+            .to_string_lossy()
+            .starts_with(r"\\?\"));
+        std::fs::remove_file(&real).ok();
     }
 
     #[test]
