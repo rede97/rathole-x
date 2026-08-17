@@ -111,6 +111,13 @@ fn status_badge(ok: bool) -> String {
     colorize(text, if ok { GREEN } else { RED })
 }
 
+/// A real runtime state that is neither healthy nor an error: transitional
+/// states (connecting, retrying, pending) and idle ones (waiting, stopped)
+/// are yellow/dim, never the red "error" reserved for actual failures.
+fn state_badge(text: &str, code: &str) -> String {
+    colorize(&format!("status: {text}"), code)
+}
+
 /// No runtime endpoint (Linux, old binary, stopped service): the state is
 /// unknown, not an error.
 fn status_unknown() -> String {
@@ -121,40 +128,66 @@ fn client_service_detail(runtime: Option<&RuntimeSnapshot>, name: &str) -> Strin
     let Some(snapshot) = runtime else {
         return format!(" [{}]", status_unknown());
     };
-    let ok = matches!(
-        snapshot.services.get(name),
+    let badge = match snapshot.services.get(name) {
         Some(RuntimeServiceSnapshot::Client {
             state: crate::runtime_status::ClientControlState::Connected,
             ..
-        })
-    );
-    format!(" [{}]", status_badge(ok))
+        }) => status_badge(true),
+        Some(RuntimeServiceSnapshot::Client {
+            state: crate::runtime_status::ClientControlState::Connecting,
+            ..
+        }) => state_badge("connecting", YELLOW),
+        Some(RuntimeServiceSnapshot::Client {
+            state: crate::runtime_status::ClientControlState::Retrying,
+            ..
+        }) => state_badge("retrying", YELLOW),
+        Some(RuntimeServiceSnapshot::Client {
+            state: crate::runtime_status::ClientControlState::Stopped,
+            ..
+        }) => state_badge("stopped", DIM),
+        // Configured but absent from the runtime snapshot (hot-reload window),
+        // or a runtime entry of the other role: transitional, not an error.
+        None | Some(RuntimeServiceSnapshot::Server { .. }) => status_unknown(),
+    };
+    format!(" [{}]", badge)
 }
 
 fn server_service_detail(runtime: Option<&RuntimeSnapshot>, name: &str) -> String {
     let Some(snapshot) = runtime else {
         return format!(" [{}]", status_unknown());
     };
-    match snapshot.services.get(name) {
+    let badge = match snapshot.services.get(name) {
         Some(RuntimeServiceSnapshot::Server {
             state: crate::runtime_status::ServerControlState::Connected,
             control_channel_source,
             ..
         }) => format!(
-            " [{}]{}",
+            "{}{}",
             status_badge(true),
             control_channel_source
                 .map(|address| format!(" [client: {}]", address))
                 .unwrap_or_default()
         ),
-        _ => format!(" [{}]", status_badge(false)),
-    }
+        // A server service with no client connected yet is idle, not broken.
+        Some(RuntimeServiceSnapshot::Server {
+            state: crate::runtime_status::ServerControlState::Waiting,
+            ..
+        }) => state_badge("waiting", YELLOW),
+        Some(RuntimeServiceSnapshot::Server {
+            state: crate::runtime_status::ServerControlState::Stopped,
+            ..
+        }) => state_badge("stopped", DIM),
+        None | Some(RuntimeServiceSnapshot::Client { .. }) => status_unknown(),
+    };
+    format!(" [{}]", badge)
 }
 
 fn client_remote_detail(runtime: Option<&RuntimeSnapshot>) -> String {
     let Some(snapshot) = runtime else {
         return format!(" [{}]", status_unknown());
     };
+    let mut connecting = false;
+    let mut stopped = false;
     let connected = snapshot
         .services
         .values()
@@ -164,11 +197,30 @@ fn client_remote_detail(runtime: Option<&RuntimeSnapshot>) -> String {
                 resolved_control_target,
                 ..
             } => *resolved_control_target,
+            RuntimeServiceSnapshot::Client {
+                state:
+                    crate::runtime_status::ClientControlState::Connecting
+                    | crate::runtime_status::ClientControlState::Retrying,
+                ..
+            } => {
+                connecting = true;
+                None
+            }
+            RuntimeServiceSnapshot::Client {
+                state: crate::runtime_status::ClientControlState::Stopped,
+                ..
+            } => {
+                stopped = true;
+                None
+            }
             _ => None,
         });
     match connected {
         Some(address) => format!(" [{}] [resolved: {}]", status_badge(true), address),
-        None => format!(" [{}]", status_badge(false)),
+        None if connecting => format!(" [{}]", state_badge("connecting", YELLOW)),
+        None if stopped => format!(" [{}]", state_badge("stopped", DIM)),
+        // A client with no services configured is idle, not broken.
+        None => format!(" [{}]", status_unknown()),
     }
 }
 
@@ -176,11 +228,14 @@ fn server_bind_detail(runtime: Option<&RuntimeSnapshot>) -> String {
     let Some(snapshot) = runtime else {
         return format!(" [{}]", status_unknown());
     };
-    let ok = matches!(
-        snapshot.server_listener.as_ref(),
-        Some(listener) if listener.state == ServerListenerState::Listening
-    );
-    format!(" [{}]", status_badge(ok))
+    let badge = match snapshot.server_listener.as_ref().map(|l| &l.state) {
+        Some(ServerListenerState::Listening) => status_badge(true),
+        Some(ServerListenerState::Pending) => state_badge("pending", YELLOW),
+        Some(ServerListenerState::Error) => status_badge(false),
+        Some(ServerListenerState::Stopped) => state_badge("stopped", DIM),
+        None => status_unknown(),
+    };
+    format!(" [{}]", badge)
 }
 
 fn client_node(c: &ClientConfig, runtime: Option<&RuntimeSnapshot>) -> Node {
@@ -788,12 +843,72 @@ token = "a"
             }),
             services: std::collections::BTreeMap::new(),
         };
-        assert_eq!(server_bind_detail(Some(&server)), " [status: error]");
+        assert_eq!(server_bind_detail(Some(&server)), " [status: pending]");
         server.server_listener = Some(crate::runtime_status::ServerListenerSnapshot {
             state: ServerListenerState::Listening,
             last_error: None,
         });
         assert_eq!(server_bind_detail(Some(&server)), " [status: ok]");
+        server.server_listener = Some(crate::runtime_status::ServerListenerSnapshot {
+            state: ServerListenerState::Error,
+            last_error: None,
+        });
+        assert_eq!(server_bind_detail(Some(&server)), " [status: error]");
         assert_eq!(server_bind_detail(None), " [status: unknown]");
+    }
+
+    /// Non-connected states render as their named state, never as "error":
+    /// a server service waiting for its client and a retrying client are
+    /// normal operational states.
+    #[test]
+    fn non_connected_states_are_not_errors() {
+        let mut server = RuntimeSnapshot {
+            schema_version: crate::runtime_status::RUNTIME_SCHEMA_VERSION,
+            role: crate::runtime_status::RuntimeRole::Server,
+            process_id: 2,
+            captured_at_unix_ms: 2,
+            server_listener: None,
+            services: std::collections::BTreeMap::new(),
+        };
+        server.services.insert(
+            "demo".to_owned(),
+            RuntimeServiceSnapshot::Server {
+                state: crate::runtime_status::ServerControlState::Waiting,
+                control_channel_source: None,
+                connected_since_unix_ms: None,
+                last_disconnected_or_error: None,
+            },
+        );
+        assert_eq!(server_service_detail(Some(&server), "demo"), " [status: waiting]");
+
+        let mut client = RuntimeSnapshot {
+            schema_version: crate::runtime_status::RUNTIME_SCHEMA_VERSION,
+            role: crate::runtime_status::RuntimeRole::Client,
+            process_id: 1,
+            captured_at_unix_ms: 1,
+            server_listener: None,
+            services: std::collections::BTreeMap::new(),
+        };
+        client.services.insert(
+            "demo".to_owned(),
+            RuntimeServiceSnapshot::Client {
+                state: crate::runtime_status::ClientControlState::Retrying,
+                configured_control_target: "example.test:2333".to_owned(),
+                resolved_control_target: None,
+                last_connected_at_unix_ms: None,
+                last_error: None,
+            },
+        );
+        assert_eq!(
+            client_service_detail(Some(&client), "demo"),
+            " [status: retrying]"
+        );
+        assert_eq!(client_remote_detail(Some(&client)), " [status: connecting]");
+        // A configured service absent from the snapshot (hot-reload window)
+        // is transitional, not an error.
+        assert_eq!(
+            client_service_detail(Some(&client), "ghost"),
+            " [status: unknown]"
+        );
     }
 }
