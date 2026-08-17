@@ -209,7 +209,11 @@ fn client_node(c: &ClientConfig, runtime: Option<&RuntimeSnapshot>) -> Node {
     }
 
     let mut services = Node::new(format!("services ({})", c.services.len()));
-    for (name, s) in &c.services {
+    // Config services live in a HashMap with random iteration order; sort by
+    // name so the tree and the JSON are identical on every invocation.
+    let mut entries: Vec<_> = c.services.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, s) in entries {
         let mut label = format!("{} → {}", name, s.local_addr);
         if s.service_type == crate::config::ServiceType::Udp {
             label.push_str(" [udp]");
@@ -244,7 +248,9 @@ fn server_node(s: &ServerConfig, runtime: Option<&RuntimeSnapshot>) -> Node {
     }
 
     let mut services = Node::new(format!("services ({})", s.services.len()));
-    for (name, svc) in &s.services {
+    let mut entries: Vec<_> = s.services.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, svc) in entries {
         let mut label = format!("{} → {}", name, svc.bind_addr);
         if svc.service_type == crate::config::ServiceType::Udp {
             label.push_str(" [udp]");
@@ -325,9 +331,10 @@ fn query_windows_service(name: &str) -> Option<(String, Option<u32>)> {
 }
 
 fn client_json(c: &ClientConfig) -> Value {
-    let services: Map<String, Value> = c
-        .services
-        .iter()
+    let mut entries: Vec<_> = c.services.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let services: Map<String, Value> = entries
+        .into_iter()
         .map(|(name, s)| {
             (
                 name.clone(),
@@ -348,9 +355,10 @@ fn client_json(c: &ClientConfig) -> Value {
 }
 
 fn server_json(s: &ServerConfig) -> Value {
-    let services: Map<String, Value> = s
-        .services
-        .iter()
+    let mut entries: Vec<_> = s.services.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let services: Map<String, Value> = entries
+        .into_iter()
         .map(|(name, svc)| {
             (
                 name.clone(),
@@ -568,7 +576,8 @@ pub fn run_status(args: &StatusArgs) -> Result<Value> {
         };
         return render_one(args, &name, config_path, &service, state_known);
     }
-    let services = crate::config_edit::list_installed_services()?;
+    let mut services = crate::config_edit::list_installed_services()?;
+    services.sort_by(|a, b| a.0.cmp(&b.0));
     let arr: Vec<Value> = services
         .iter()
         .map(|(name, role)| {
@@ -696,6 +705,47 @@ token = "abc"
         assert_eq!(result["config"]["access"], "missing");
         assert_eq!(result["config"]["exists"], false);
         std::fs::remove_dir_all(&dir).ok();
+    }
+    /// Config services live in a HashMap with random iteration order; the
+    /// rendered tree and the JSON object must always list them sorted by
+    /// name so repeated `status` invocations produce identical output.
+    #[test]
+    fn services_render_sorted_by_name() {
+        const MULTI: &str = r#"
+[client]
+remote_addr = "127.0.0.1:2333"
+
+[client.services.zeta]
+local_addr = "127.0.0.1:8001"
+token = "a"
+
+[client.services.alpha]
+local_addr = "127.0.0.1:8002"
+token = "a"
+
+[client.services.mid]
+local_addr = "127.0.0.1:8003"
+token = "a"
+"#;
+        let config: crate::config::Config = toml::from_str(MULTI).unwrap();
+        let client = config.client.unwrap();
+
+        let node = client_node(&client, None);
+        let mut out = String::new();
+        render_tree(&node, "", true, &mut out);
+        let alpha = out.find("alpha").expect("alpha in tree");
+        let mid = out.find("mid").expect("mid in tree");
+        let zeta = out.find("zeta").expect("zeta in tree");
+        assert!(alpha < mid && mid < zeta, "services not sorted:\n{out}");
+
+        let value = client_json(&client);
+        let keys: Vec<&str> = value["services"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["alpha", "mid", "zeta"]);
     }
     #[test]
     fn runtime_badges_reflect_client_and_server_state() {
