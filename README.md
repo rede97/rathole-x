@@ -39,6 +39,12 @@ In every scenario the same secure-by-default tooling does the work: `service ins
 - **Platform integration.** Windows SCM service plus UAC elevation; Linux systemd and OpenRC services (see [docs/linux-service.md](docs/linux-service.md)).
 - **Secure defaults.** Tokens are mandatory; config edits are gated by the actual file permissions — the CLI probes whether the current user can write the config and elevates (UAC) only when not; the service binary is copied into `ProgramData` and is not replaceable by non-admins. Read-only status (SCM state, runtime connection snapshot, and the installed config tree) is readable by local users without UAC; `permission denied`, `missing`, and `unavailable` are reported distinctly.
 
+## Agent skills
+
+`rathole-x` ships agent-consumable skills for AI coding and automation assistants that operate the CLI on a user's behalf. The CLI is agent-friendly by design — every operation is a subcommand, `--json` emits exactly one machine-readable envelope, `--yes` enables unattended use — and the skill documents the full workflow: downloading and verifying the release binary for the host architecture, installing the service, managing entries with `config add|set|remove`, and verifying with `status --json`.
+
+- [rathole-x-config](skills/rathole-x-config/SKILL.md) — configure and deploy relays end-to-end through the CLI: service install, config management, transport selection, token handling, and failure triage. The `.md` front matter includes a `description` field usable as a tool/agent definition.
+
 ## New features over upstream
 
 - **Subcommand-driven CLI** — `run` (run the daemon), `config add|remove|list|set` (manage the service configuration), `status` (service state + config tree), `genkey` (generate a noise keypair), `service install|uninstall|start|stop|restart` (system service lifecycle), `upgrade` (update the installed binary). See [CLI reference](#cli-reference) for flags.

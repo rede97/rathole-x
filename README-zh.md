@@ -38,6 +38,12 @@ rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://g
 - **平台集成。** Windows SCM 服务 + UAC 提权；Linux systemd 与 OpenRC 服务（见 [docs/linux-service.md](docs/linux-service.md)）。
 - **安全默认值。** token 为必填；配置编辑受实际文件权限约束——CLI 会探测当前用户是否可写该配置，仅当不可写时才提权（UAC）；服务二进制被复制到 `ProgramData`，非管理员无法替换。只读状态（SCM 状态、runtime 连接快照、已安装配置树）对本地用户可读、无需 UAC；`permission denied`、`missing`、`unavailable` 三类原因分别明确报告。
 
+## Agent 技能
+
+`rathole-x` 附带面向 AI 编码/自动化助手的技能文档，供其在用户机器上通过 CLI 代劳部署与配置。CLI 本身对 Agent 友好——每个操作都是子命令、`--json` 只输出一个机器可读封套、`--yes` 支持无人值守——技能文档覆盖完整流程：按宿主机架构下载并校验发布二进制、安装服务、通过 `config add|set|remove` 管理条目、并用 `status --json` 验证。
+
+- [rathole-x-config](skills/rathole-x-config/SKILL.md) — 通过 CLI 端到端配置与部署中继：服务安装、配置管理、传输协议选择、token 处理与故障排查。文件头部的 `description` front matter 可直接用作工具/Agent 定义。
+
 ## New features over upstream
 
 - **子命令驱动的 CLI** — `run`（运行守护进程）、`config add|remove|list|set`（管理服务配置）、`status`（服务状态 + 配置树）、`genkey`（生成 noise 密钥对）、`service install|uninstall|start|stop|restart`（系统服务生命周期）、`upgrade`（更新已安装二进制）。各 flag 见 [CLI reference](#cli-reference)。
