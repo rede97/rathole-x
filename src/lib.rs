@@ -318,6 +318,14 @@ fn dispatch_service_command(cmd: cli::ServiceCmd) -> Result<Value> {
                     config_path.display()
                 ),
             )?;
+            // Elevate BEFORE writing the skeleton config: when the target
+            // (or its parent directory) is not writable by the current user,
+            // ensure_role_config would fail before install_service's own
+            // elevation check ever runs. The elevated child re-runs the whole
+            // command line and performs the install there.
+            if platform::elevate_for_config_if_needed(&config_path)? {
+                return Ok(json!({"relayed": true}));
+            }
             let created = config_edit::ensure_role_config(&config_path, role)?;
             if created && !i.json {
                 println!(

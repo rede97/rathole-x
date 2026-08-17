@@ -312,7 +312,11 @@ pub fn relaunch_elevated_wait(args: &[OsString]) -> Result<String> {
         code
     };
 
-    let output = std::fs::read_to_string(&log_path)
+    // The log mixes this process's UTF-8 output with anything older builds
+    // (or non-transcoded tools) wrote in the ANSI codepage; decode lossily
+    // rather than dropping the whole log.
+    let output = std::fs::read(&log_path)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .unwrap_or_else(|e| format!("<(elevation log {} unreadable: {})", log_path.display(), e));
     if exit_code != 0 {
         // Keep the log file for diagnosis: it holds everything the hidden
@@ -490,14 +494,75 @@ fn exe_lockdown_args(exe: &Path, services: &[String]) -> Vec<Vec<OsString>> {
     path_lockdown_args(exe, &grant_refs)
 }
 
+/// Decode bytes printed by a console child process. Windows command-line
+/// tools (icacls, sc.exe) emit localized text in the process ANSI codepage
+/// (GBK on zh-CN, CP1252 on en-US, ...), so the raw bytes are not valid
+/// UTF-8; transcode via the system MultiByteToWideChar API so everything
+/// this process itself prints — terminals and the UAC elevation log
+/// included — stays standard UTF-8.
+fn console_text(bytes: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_owned();
+    }
+    use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_ACP};
+    // SAFETY: `bytes` outlives both calls; the wide buffer is sized by the
+    // query call and only the reported length is read back.
+    unsafe {
+        let len = MultiByteToWideChar(
+            CP_ACP,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            std::ptr::null_mut(),
+            0,
+        );
+        if len <= 0 {
+            return String::from_utf8_lossy(bytes).into_owned();
+        }
+        let mut wide = vec![0u16; len as usize];
+        let written = MultiByteToWideChar(
+            CP_ACP,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            wide.as_mut_ptr(),
+            len,
+        );
+        if written <= 0 {
+            return String::from_utf8_lossy(bytes).into_owned();
+        }
+        wide.truncate(written as usize);
+        String::from_utf16_lossy(&wide)
+    }
+}
+
+/// Re-emit a captured child process's output through this module's UTF-8
+/// stdio (JSON mode routes to stderr), keeping the elevation relay log
+/// decodable regardless of the child's codepage.
+fn echo_child_output(output: &std::process::Output) {
+    let text = console_text(&output.stdout);
+    if !text.trim().is_empty() {
+        println!("{}", text.trim_end());
+    }
+    let err_text = console_text(&output.stderr);
+    if !err_text.trim().is_empty() {
+        eprintln!("{}", err_text.trim_end());
+    }
+}
+
 /// Run one `sc.exe` invocation; failures are fatal to the caller.
 fn run_sc(args: &[&str]) -> Result<()> {
-    let status = std::process::Command::new("sc.exe")
+    let output = std::process::Command::new("sc.exe")
         .args(args)
-        .status()
+        .output()
         .with_context(|| format!("failed to run `sc.exe {}`", args.join(" ")))?;
-    if !status.success() {
-        bail!("`sc.exe {}` failed (exit {})", args.join(" "), status);
+    echo_child_output(&output);
+    if !output.status.success() {
+        bail!(
+            "`sc.exe {}` failed (exit {})",
+            args.join(" "),
+            output.status
+        );
     }
     Ok(())
 }
@@ -603,14 +668,15 @@ pub fn replace_file_preserving_security(replacement: &Path, replaced: &Path) -> 
 /// Run one icacls invocation; failures are fatal: an install that cannot
 /// lock down its files must not proceed (LocalSystem escalation risk).
 fn run_icacls(args: &[OsString]) -> Result<()> {
-    let status = std::process::Command::new("icacls")
+    let output = std::process::Command::new("icacls")
         .args(args)
-        .status()
+        .output()
         .context("failed to run icacls")?;
-    if !status.success() {
+    echo_child_output(&output);
+    if !output.status.success() {
         bail!(
             "icacls failed (exit {}) on `{}`",
-            status,
+            output.status,
             Path::new(&args[0]).display()
         );
     }
@@ -660,28 +726,11 @@ pub fn install(opts: &ServiceInstallOptions) -> Result<()> {
 
     let service_name = scm_name(opts.role, &opts.name);
 
-    // Lock down the directory, the service binary, the config and the log
-    // directory BEFORE the service is registered: the directory may have
-    // been pre-created by the un-elevated CLI (CREATOR OWNER = the
-    // installing user) or `--config` may point at any user-writable
-    // directory; either way the service must never run a binary or read
-    // secrets from a location a normal user can replace or read.
     // The log directory is pre-created so the write-restricted service
     // token never needs to create directories.
     let log_dir = dir.join("logs");
     std::fs::create_dir_all(&log_dir)
         .with_context(|| format!("failed to create log directory {}", log_dir.display()))?;
-    let services = managed_service_names(&service_name);
-    for args in lockdown_icacls_args(
-        &dir,
-        &installed_exe,
-        &opts.config_path,
-        &log_dir,
-        &services,
-        opts.allow_user_config,
-    ) {
-        run_icacls(&args)?;
-    }
 
     let manager = ServiceManager::local_computer(
         None::<&str>,
@@ -729,6 +778,35 @@ pub fn install(opts: &ServiceInstallOptions) -> Result<()> {
         let _ = service.delete();
         return Err(e).context(format!(
             "failed to harden service '{}'; rolled back its SCM registration",
+            service_name
+        ));
+    }
+
+    // Lock down the directory, the service binary, the config and the log
+    // directory AFTER registration+hardening but BEFORE the first start:
+    // per-service SID grants (NT SERVICE\<name>) only resolve once the SCM
+    // knows the service (a fresh name fails icacls with ERROR_NONE_MAPPED
+    // 1332), and nothing executes the binary before start, so registering
+    // first does not weaken the lockdown. A lockdown failure rolls back the
+    // registration so a retry does not hit ERROR_SERVICE_EXISTS.
+    let services = managed_service_names(&service_name);
+    let lockdown = (|| -> Result<()> {
+        for args in lockdown_icacls_args(
+            &dir,
+            &installed_exe,
+            &opts.config_path,
+            &log_dir,
+            &services,
+            opts.allow_user_config,
+        ) {
+            run_icacls(&args)?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = lockdown {
+        let _ = service.delete();
+        return Err(e).context(format!(
+            "failed to lock down files for service '{}'; rolled back its SCM registration",
             service_name
         ));
     }
