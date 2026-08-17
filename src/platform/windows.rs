@@ -42,7 +42,8 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::{
-    GetTokenInformation, TokenElevation, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_QUERY,
+    GetTokenInformation, TokenElevation, TokenRestrictedSids, TokenUser, SECURITY_ATTRIBUTES,
+    TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER,
 };
 
 use windows_sys::Win32::Storage::FileSystem::{
@@ -1883,10 +1884,129 @@ pub fn redirect_stdio_to_file(path: &Path) {
     std::mem::forget(file);
 }
 /// The local status pipe has no command surface: every authenticated caller
-/// can request exactly one bounded snapshot. `AU` covers local authenticated
-/// logons; the pipe also grants Administrators and LocalSystem. Remote
+/// can request exactly one bounded snapshot.
+///
+/// SDDL for the status pipe: any local authenticated user may connect
+/// (read-only snapshot), Administrators and SYSTEM have full access. Remote
 /// clients are rejected separately by the pipe creation flag.
-const STATUS_PIPE_SDDL: &str = "D:P(A;;GRGW;;;AU)(A;;GA;;;BA)(A;;GA;;;SY)";
+///
+/// The creator's SIDs — the token user AND every restricted SID — MUST be
+/// in the DACL: creating a follow-up instance of an existing pipe name is
+/// access-checked against the existing pipe object, and for a hardened
+/// service account (LocalService + write-restricted per-service SID) the
+/// restricted SIDs must pass the check too. Granting only the user SID
+/// still fails with ERROR_ACCESS_DENIED, killing the accept loop on the
+/// first client connection.
+fn status_pipe_sddl() -> String {
+    let mut sddl = String::from("D:P");
+    for sid in pipe_creator_sids() {
+        sddl.push_str(&format!("(A;;GA;;;{sid})"));
+    }
+    sddl.push_str("(A;;GRGW;;;AU)(A;;GA;;;BA)(A;;GA;;;SY)");
+    sddl
+}
+
+/// SIDs that must hold full access to the status pipe: the process token's
+/// user plus every restricted SID (the per-service SID for a hardened
+/// service; none for a normal foreground process).
+fn pipe_creator_sids() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(sid) = token_user_sid_string() {
+        out.push(sid);
+    }
+    out.extend(token_restricted_sid_strings());
+    out
+}
+
+/// Render a SID as its SDDL string form (S-1-5-...).
+fn sid_to_string(sid: *mut core::ffi::c_void) -> Option<String> {
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    // SAFETY: `sid` is a valid SID provided by the caller; the returned
+    // string is LocalAlloc'ed and freed here after copying.
+    unsafe {
+        let mut wide: windows_sys::core::PWSTR = std::ptr::null_mut();
+        if ConvertSidToStringSidW(sid as *mut _, &mut wide) == 0 {
+            return None;
+        }
+        let mut chars = 0usize;
+        while *wide.add(chars) != 0 {
+            chars += 1;
+        }
+        let out = String::from_utf16_lossy(std::slice::from_raw_parts(wide, chars));
+        LocalFree(wide as *mut _);
+        Some(out)
+    }
+}
+
+/// Open the current process token with TOKEN_QUERY and run `f` on it.
+fn with_process_token<T>(f: impl FnOnce(HANDLE) -> Option<T>) -> Option<T> {
+    // SAFETY: the process pseudo-handle is always valid; the opened token is
+    // closed exactly once.
+    unsafe {
+        let process = GetCurrentProcess();
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
+            return None;
+        }
+        let result = f(token);
+        CloseHandle(token);
+        result
+    }
+}
+
+/// The current process token's user SID in SDDL string form.
+fn token_user_sid_string() -> Option<String> {
+    with_process_token(|token| unsafe {
+        let mut len = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len);
+        let mut buf = vec![0u8; len as usize];
+        let ok = GetTokenInformation(
+            token,
+            TokenUser,
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            len,
+            &mut len,
+        );
+        if ok == 0 {
+            return None;
+        }
+        let user = &*(buf.as_ptr() as *const TOKEN_USER);
+        sid_to_string(user.User.Sid)
+    })
+}
+
+/// Every restricted SID of the current process token, in SDDL string form.
+fn token_restricted_sid_strings() -> Vec<String> {
+    with_process_token(|token| unsafe {
+        let mut len = 0u32;
+        let _ = GetTokenInformation(token, TokenRestrictedSids, std::ptr::null_mut(), 0, &mut len);
+        if len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; len as usize];
+        let ok = GetTokenInformation(
+            token,
+            TokenRestrictedSids,
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            len,
+            &mut len,
+        );
+        if ok == 0 {
+            return None;
+        }
+        let groups = &*(buf.as_ptr() as *const TOKEN_GROUPS);
+        let sids = std::slice::from_raw_parts(
+            groups.Groups.as_ptr(),
+            groups.GroupCount as usize,
+        );
+        Some(
+            sids.iter()
+                .filter_map(|g| sid_to_string(g.Sid))
+                .collect::<Vec<_>>(),
+        )
+    })
+    .unwrap_or_default()
+}
 
 fn create_status_pipe(endpoint: &str, first_instance: bool) -> Result<NamedPipeServer> {
     let pipe_name: Vec<u16> = OsStr::new(endpoint).encode_wide().chain(Some(0)).collect();
@@ -1894,7 +2014,8 @@ fn create_status_pipe(endpoint: &str, first_instance: bool) -> Result<NamedPipeS
     // SAFETY: both the pipe name and SDDL are nul-terminated. Windows copies
     // the descriptor while creating the pipe, so it is released immediately
     // after CreateNamedPipeW returns.
-    let sddl: Vec<u16> = STATUS_PIPE_SDDL.encode_utf16().chain(Some(0)).collect();
+    let sddl_text = status_pipe_sddl();
+    let sddl: Vec<u16> = sddl_text.encode_utf16().chain(Some(0)).collect();
     let descriptor_ok = unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
             sddl.as_ptr(),
@@ -2038,16 +2159,20 @@ mod tests {
     /// Regression probe for the hardened service account: a service running
     /// as LocalService with a write-restricted per-service SID
     /// (`sc sidtype restricted`) must still be able to create the runtime
-    /// status pipe. Simulates the SCM token shape: the current token plus a
-    /// service SID as a restricted SID, impersonated on this thread.
+    /// status pipe AND its follow-up instances. Simulates the SCM token
+    /// shape: Authenticated Users disabled (LocalService is not a member)
+    /// plus a service SID as a restricted SID, impersonated on this thread.
+    /// The second-instance creation is access-checked against the existing
+    /// pipe object, which is why the pipe DACL must include the creator.
     #[test]
     fn restricted_service_token_can_create_status_pipe() {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
         use windows_sys::Win32::Security::{
             CreateRestrictedToken, DuplicateTokenEx, LookupAccountNameW, RevertToSelf,
             SecurityImpersonation, TokenImpersonation, SID_AND_ATTRIBUTES, SID_NAME_USE,
-            TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY,
+            TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY, WRITE_RESTRICTED,
         };
         use windows_sys::Win32::System::Threading::SetThreadToken;
 
@@ -2076,6 +2201,14 @@ mod tests {
             eprintln!("NT SERVICE\\Schedule not resolvable; skipping probe");
             return;
         }
+        // S-1-5-11 = Authenticated Users; disabled to simulate LocalService.
+        let au_str: Vec<u16> = OsStr::new("S-1-5-11").encode_wide().chain(Some(0)).collect();
+        let mut au_sid: *mut core::ffi::c_void = std::ptr::null_mut();
+        let ok = unsafe { ConvertStringSidToSidW(au_str.as_ptr(), &mut au_sid) };
+        if ok == 0 {
+            eprintln!("S-1-5-11 not convertible; skipping probe");
+            return;
+        }
 
         unsafe {
             let process = GetCurrentProcess();
@@ -2098,6 +2231,10 @@ mod tests {
                 0,
                 "DuplicateTokenEx"
             );
+            let disable = SID_AND_ATTRIBUTES {
+                Sid: au_sid as *mut _,
+                Attributes: 0,
+            };
             let restrict = SID_AND_ATTRIBUTES {
                 Sid: sid_buf.as_ptr() as *mut _,
                 Attributes: 0,
@@ -2106,9 +2243,9 @@ mod tests {
             assert_ne!(
                 CreateRestrictedToken(
                     impersonation,
-                    0,
-                    0,
-                    std::ptr::null(),
+                    WRITE_RESTRICTED,
+                    1,
+                    &disable,
                     0,
                     std::ptr::null(),
                     1,
@@ -2124,22 +2261,30 @@ mod tests {
                 "SetThreadToken"
             );
 
-            // The exact pipe creation the service performs at startup.
+            // The exact pipe creation the service performs at startup, then
+            // the follow-up instance created after the first client connects
+            // (access-checked against the existing pipe object — the
+            // regression this probe defends).
             let endpoint = crate::runtime_status::endpoint_for_config(
                 &std::env::temp_dir().join(format!(
                     "rathole-x-restricted-probe-{}.toml",
                     std::process::id()
                 )),
             );
-            let result = create_status_pipe(&endpoint, true);
+            let first = create_status_pipe(&endpoint, true).expect(
+                "a write-restricted service token must be able to create the status pipe",
+            );
+            let second = create_status_pipe(&endpoint, false);
 
             RevertToSelf();
             CloseHandle(restricted);
             CloseHandle(impersonation);
             CloseHandle(token);
+            LocalFree(au_sid as *mut _);
 
-            drop(result.expect(
-                "a write-restricted service token must be able to create the status pipe",
+            drop(first);
+            drop(second.expect(
+                "a hardened service token must be able to create follow-up pipe instances",
             ));
         }
     }

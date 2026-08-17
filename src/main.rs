@@ -92,15 +92,21 @@ async fn main() -> Result<()> {
     }
     #[cfg(not(feature = "console"))]
     {
-        let is_atty = atty::is(atty::Stream::Stdout);
+        // The `service run` entry point installs its own file subscriber in
+        // service_main_inner; installing the stdout subscriber here first
+        // would silently shadow it (try_init fails when a global default
+        // exists) and every service log line would be lost to the void.
+        if !args.is_service_run() {
+            let is_atty = atty::is(atty::Stream::Stdout);
 
-        let level = "info"; // if RUST_LOG not present, use `info` level
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::from(level)),
-            )
-            .with_ansi(is_atty)
-            .init();
+            let level = "info"; // if RUST_LOG not present, use `info` level
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::from(level)),
+                )
+                .with_ansi(is_atty)
+                .init();
+        }
     }
 
     run(args, shutdown_rx).await

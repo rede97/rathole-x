@@ -51,6 +51,7 @@ pub struct Cli {
     #[clap(subcommand)]
     pub command: Option<Commands>,
 
+
     /// Redirect all output to this file (used by the UAC elevation relay)
     #[clap(long, hide = true, global = true)]
     pub elevated_log: Option<PathBuf>,
@@ -60,6 +61,22 @@ pub struct Cli {
     /// re-runs the same command line and must not ask again)
     #[clap(long, hide = true, global = true)]
     pub confirmed: bool,
+}
+
+impl Cli {
+    /// Whether this invocation is the hidden SCM service entry point
+    /// (`service run`). That path installs its own file subscriber in
+    /// `service_main_inner`, so main must not pre-install the stdout
+    /// subscriber (a global default makes the later try_init a silent no-op
+    /// and every service log line would be lost).
+    pub fn is_service_run(&self) -> bool {
+        matches!(
+            self.command,
+            Some(Commands::Service {
+                cmd: ServiceCmd::Run { .. }
+            })
+        )
+    }
 }
 
 #[derive(Subcommand, Debug, Clone)]
