@@ -30,8 +30,9 @@ jobs:
       # default native-tls/Schannel feature set.
       - name: Clippy
         run: >
-          cargo clippy -- -D warnings
-          --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
+          cargo clippy --no-default-features
+          --features server,client,rustls,noise,websocket-rustls,hot-reload
+          -- -D warnings
       - name: Setup cargo-hack
         run: cargo install cargo-hack
       - name: Check all features
