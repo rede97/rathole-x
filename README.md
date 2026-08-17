@@ -19,13 +19,24 @@ rathole, like [frp](https://github.com/fatedier/frp) and [ngrok](https://github.
 
 `rathole-x` is an enhanced fork of [rathole](https://github.com/rapiz1/rathole) that keeps the **wire protocol 100% upstream-compatible** — upstream rathole clients and servers interoperate with `rathole-x` — while adding a subcommand-driven CLI, zero-config-file-handcrafting workflows, and deeper platform integration. The binary name is `rathole-x`.
 
+## Who it is for
+
+`rathole-x` is built for self-hosted, single-admin environments where installing and operating the relay should be safe and uneventful:
+
+- **Personal x64 hosts and home servers** — expose SSH, a NAS, or a home-lab service behind NAT; installed once as a boot-enabled systemd/OpenRC service.
+- **Public servers (VPS)** — the relay side, deployed with the same one-command service install.
+- **Raspberry Pi and other ARM boards** — Debian/Raspberry Pi OS (32-bit armv7 and 64-bit) and Alpine run the static musl binaries (zero system dependencies); a Docker image is available for container-first setups.
+- **Personal Windows machines** — a real SCM service installed through a UAC-guided flow, not a scheduled-task workaround.
+
+In every scenario the same secure-by-default tooling does the work: `service install` registers a least-privilege system service, `config add|set|remove` manages configuration without hand-editing TOML, `status` inspects runtime state without elevation, and hot reload applies changes in place.
+
 ## Design philosophy
 
 - **One binary, subcommand-driven CLI.** Human-friendly: interactive prompts plus auto-generated tokens and noise keys. Agent-friendly: everything is available as flags, with `--json` output and a `--yes` non-interactive mode.
 - **Zero config-file handcrafting.** `service install <server|client>` deploys a system service with a role-specific skeleton config; `config add`/`config set` manage everything; hot reload applies changes without restarting.
 - **One process, one role.** Every foreground or installed process runs exactly one role (server or client) from one role-specific config. To run both on a host, configure and run two independent processes.
 - **Upstream-compatible wire protocol.** `rathole-x` speaks the same wire protocol as upstream rathole, so the two interoperate.
-- **Platform integration.** Windows SCM service plus UAC elevation; Linux systemd is planned (see [docs/plan-linux-service.md](docs/plan-linux-service.md)).
+- **Platform integration.** Windows SCM service plus UAC elevation; Linux systemd and OpenRC services (see [docs/linux-service.md](docs/linux-service.md)).
 - **Secure defaults.** Tokens are mandatory; config edits are gated by the actual file permissions — the CLI probes whether the current user can write the config and elevates (UAC) only when not; the service binary is copied into `ProgramData` and is not replaceable by non-admins. Read-only status (SCM state, runtime connection snapshot, and the installed config tree) is readable by local users without UAC; `permission denied`, `missing`, and `unavailable` are reported distinctly.
 
 ## New features over upstream

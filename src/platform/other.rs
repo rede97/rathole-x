@@ -1,5 +1,5 @@
-//! Portable stubs for platforms without service support yet.
-//! Linux systemd is planned: see docs/plan-linux-service.md.
+//! Portable stubs for platforms without service support (anything that is
+//! not Windows or Linux).
 
 use std::path::{Path, PathBuf};
 
@@ -15,8 +15,7 @@ pub fn redirect_stdio_to_file(_path: &Path) {
 }
 
 pub fn elevate_for_config_if_needed(_path: &Path) -> Result<bool> {
-    // On Linux the service config lives under /etc and the CLI is expected to
-    // run under sudo when needed; see docs/plan-linux-service.md.
+    // No elevation mechanism on this platform.
     Ok(false)
 }
 
@@ -27,7 +26,7 @@ pub fn install_service(
     config_path: &Path,
 ) -> Result<()> {
     if !crate::is_json_mode() {
-        println!("Linux systemd support is planned; see docs/plan-linux-service.md");
+        println!("service management is not supported on this platform");
         println!(
             "Would install {} service '{}' (config: {})",
             role.key(),
@@ -40,28 +39,28 @@ pub fn install_service(
 
 pub fn uninstall_service(_args: &UninstallArgs, _config_path: &Path) -> Result<()> {
     if !crate::is_json_mode() {
-        println!("Linux systemd support is planned; see docs/plan-linux-service.md");
+        println!("service management is not supported on this platform");
     }
     Ok(())
 }
 
 pub fn uninstall_all(_args: &UninstallArgs) -> Result<()> {
     if !crate::is_json_mode() {
-        println!("Linux systemd support is planned; see docs/plan-linux-service.md");
+        println!("service management is not supported on this platform");
     }
     Ok(())
 }
 
 pub fn control_service(_cmd: crate::cli::ServiceCmd) -> Result<()> {
     if !crate::is_json_mode() {
-        println!("Linux systemd support is planned; see docs/plan-linux-service.md");
+        println!("service management is not supported on this platform");
     }
     Ok(())
 }
 
 pub fn upgrade_binary() -> Result<()> {
     if !crate::is_json_mode() {
-        println!("Linux systemd support is planned; see docs/plan-linux-service.md");
+        println!("service management is not supported on this platform");
     }
     Ok(())
 }

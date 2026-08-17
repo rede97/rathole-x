@@ -10,7 +10,7 @@ Non-negotiable product rules:
 - One process runs one role. A config containing both `[client]` and `[server]` requires explicit `run --client` or `run --server`; normal deployment uses separate configs/processes.
 - Manage configs through `service install` and `config add|set|remove`; do not hand-write or partially write config files from code.
 - `--json` commands emit one stdout envelope: `{ "ok": true, "result": ... }` or `{ "ok": false, "error": { "message": ... } }`. Unattended destructive commands require `--yes`.
-- Windows service support is implemented. Linux systemd support in `docs/plan-linux-service.md` is a plan, not an implementation.
+- Windows service support is implemented. Linux service support (systemd and OpenRC) is implemented; `docs/linux-service.md` is the frozen design baseline.
 
 ## Architecture & Data Flow
 

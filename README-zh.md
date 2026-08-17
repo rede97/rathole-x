@@ -18,13 +18,24 @@ rathole，类似于 [frp](https://github.com/fatedier/frp) 和 [ngrok](https://g
 
 `rathole-x` 是 [rathole](https://github.com/rapiz1/rathole) 的增强分支，保持**线协议与上游 100% 兼容**——上游 rathole 的客户端与服务端均可与 `rathole-x` 互通——同时新增了子命令驱动的 CLI、免手写配置文件的流程，以及更深入的平台集成。二进制文件名为 `rathole-x`。
 
+## 适用场景
+
+`rathole-x` 面向自托管、单人运维的环境，核心目标是让中继的安装与日常运行安全、省心：
+
+- **个人 x64 主机与家庭服务器** — 把 NAT 后的 SSH、NAS、家庭实验室服务暴露到公网；一次安装为开机自启的 systemd/OpenRC 服务。
+- **公网服务器（VPS）** — 中继侧，同一条命令完成服务化部署。
+- **树莓派等 ARM 开发板** — Debian/Raspberry Pi OS（32 位 armv7 与 64 位）与 Alpine 均可使用静态 musl 二进制（零系统依赖）；容器优先的环境提供 Docker 镜像。
+- **个人 Windows 电脑** — 通过 UAC 引导的流程安装为真正的 SCM 服务，而不是计划任务权宜之计。
+
+所有场景共用同一套安全可靠的安装配置工具：`service install` 注册最小权限系统服务，`config add|set|remove` 免手写 TOML 管理配置，`status` 免提权查看运行时状态，热重载就地应用变更。
+
 ## Design philosophy
 
 - **单一二进制、子命令驱动的 CLI。** 对人友好：交互式提示 + 自动生成的 token 与 noise 密钥。对脚本/Agent 友好：所有操作都有对应 flag，支持 `--json` 输出与 `--yes` 非交互模式。
 - **免手写配置文件。** `service install <server|client>` 部署系统服务并创建角色专属的骨架配置；`config add`/`config set` 管理全部内容；热重载无需重启即可应用变更。
 - **一个进程一个角色。** 每个前台或已安装进程只运行 server 或 client 之一，并使用角色专属配置；同一主机需要两种角色时配置并运行两个独立进程。
 - **与上游兼容的线协议。** `rathole-x` 使用与上游 rathole 相同的线协议，因此二者可互通。
-- **平台集成。** Windows SCM 服务 + UAC 提权；Linux systemd 已规划（见 [docs/plan-linux-service.md](docs/plan-linux-service.md)）。
+- **平台集成。** Windows SCM 服务 + UAC 提权；Linux systemd 与 OpenRC 服务（见 [docs/linux-service.md](docs/linux-service.md)）。
 - **安全默认值。** token 为必填；配置编辑受实际文件权限约束——CLI 会探测当前用户是否可写该配置，仅当不可写时才提权（UAC）；服务二进制被复制到 `ProgramData`，非管理员无法替换。只读状态（SCM 状态、runtime 连接快照、已安装配置树）对本地用户可读、无需 UAC；`permission denied`、`missing`、`unavailable` 三类原因分别明确报告。
 
 ## New features over upstream

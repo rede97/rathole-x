@@ -1,6 +1,6 @@
-# rathole-x Linux 服务化计划(systemd)
+# rathole-x Linux 服务化设计与实现（systemd / OpenRC）
 
-> 状态：已实现（systemd 后端 `src/platform/systemd.rs`；OpenRC 后端 `src/platform/openrc.rs`；门面 `src/platform/linux.rs` 负责检测 init 系统并分发）。本文档是冻结的设计基准；Windows 侧对应实现见 `src/platform/windows.rs`。
+> 状态：已实现（systemd 后端 `src/platform/systemd.rs`；OpenRC 后端 `src/platform/openrc.rs`；门面 `src/platform/linux.rs` 负责检测 init 系统并分发；运行时状态端点为 abstract namespace Unix socket）。本文档是冻结的设计基准；Windows 侧对应实现见 `src/platform/windows.rs`。
 
 ## 目标
 

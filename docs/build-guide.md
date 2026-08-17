@@ -136,6 +136,8 @@ cargo test --locked --release --target armv7-unknown-linux-musleabihf \
 
 `cargo zigbuild --release --target <musl-triple> ...` also works and handles the CRT details itself, but has no `test`/`check` subcommand — for those use plain `cargo` with the config above.
 
+To package local release artifacts the same way CI does (`dist/rathole-x-<target>.tar.gz` plus `sha256sums.txt`), run `scripts/dist.sh`; it builds the default target set (`x86_64-unknown-linux-musl`, `armv7-unknown-linux-musleabihf`, override with `TARGETS=...`).
+
 ### Testing in an ARM rootfs (Raspberry Pi 3B 32-bit stand-in)
 
 A Pi 3B in 32-bit mode runs an ARMv7 hard-float userland; the ~3 MB [Alpine armhf minirootfs](https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/armhf/) is a compact stand-in (a Raspberry Pi OS 32-bit rootfs works identically). Because the musl binary is fully static it runs in any armhf rootfs:
