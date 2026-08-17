@@ -70,8 +70,9 @@ pub fn run_service(_config: std::path::PathBuf) -> Result<()> {
     bail!("`service run` is the Windows SCM entry point and is not available on this platform")
 }
 
-/// Linux/systemd has no runtime-status endpoint yet. Keep the façade so
-/// callers can represent this as unavailable rather than failing `status`.
+/// This platform has no runtime-status endpoint yet (Windows and Linux do).
+/// Keep the façade so callers can represent this as unavailable rather than
+/// failing `status`.
 pub fn spawn_runtime_status_server(
     _config_path: PathBuf,
     _registry: RuntimeRegistry,
@@ -81,5 +82,5 @@ pub fn spawn_runtime_status_server(
 }
 
 pub fn query_runtime_status(_config_path: &Path) -> Result<RuntimeSnapshot> {
-    bail!("runtime status endpoint is planned for Linux/systemd")
+    bail!("runtime status endpoint is not available on this platform")
 }

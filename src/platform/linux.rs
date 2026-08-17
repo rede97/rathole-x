@@ -1,14 +1,21 @@
 //! Linux service integration with systemd and OpenRC backends.
 
+use std::io::{Read, Write};
+use std::os::linux::net::SocketAddrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
+use tracing::{error, warn};
 
 use crate::cli::{InstallArgs, ServiceCmd, UninstallArgs};
 use crate::config_edit::{self, ServiceRole};
-use crate::runtime_status::{RuntimeRegistry, RuntimeSnapshot};
+use crate::runtime_status::{
+    snapshot, status_name_for_config, RuntimeRegistry, RuntimeSnapshot, MAX_STATUS_RESPONSE,
+    STATUS_REQUEST,
+};
 
 pub(crate) const SERVICE_ACCOUNT: &str = "rathole-x";
 pub(crate) const SERVICE_GROUP: &str = "rathole-x";
@@ -249,19 +256,136 @@ pub fn redirect_stdio_to_file(_path: &Path) {}
 pub fn elevate_for_config_if_needed(_path: &Path) -> Result<bool> {
     Ok(false)
 }
+/// Abstract-namespace socket address for the config's status endpoint. An
+/// abstract name needs no filesystem directory, has no stale-file lifecycle,
+/// and any local user may connect — the Linux analogue of the Windows pipe
+/// ACL that grants every authenticated user read/write access.
+fn status_socket_addr(config_path: &Path) -> Result<std::os::unix::net::SocketAddr> {
+    let name = status_name_for_config(config_path);
+    <std::os::unix::net::SocketAddr as SocketAddrExt>::from_abstract_name(name.as_bytes())
+        .context("failed to build runtime status socket address")
+}
+
+async fn answer_status_request(mut stream: tokio::net::UnixStream, registry: RuntimeRegistry) {
+    let mut request = [0u8; STATUS_REQUEST.len()];
+    if stream.read_exact(&mut request).await.is_err() || request != STATUS_REQUEST {
+        return;
+    }
+    let response = match serde_json::to_vec(&snapshot(&registry)) {
+        Ok(response) if response.len() <= MAX_STATUS_RESPONSE => response,
+        Ok(_) => {
+            error!("runtime status snapshot exceeds its bounded response size");
+            return;
+        }
+        Err(error) => {
+            error!("failed to serialize runtime status snapshot: {}", error);
+            return;
+        }
+    };
+    let len = (response.len() as u32).to_le_bytes();
+    if stream.write_all(&len).await.is_ok() {
+        let _ = stream.write_all(&response).await;
+    }
+}
+
+/// Start the local-only status endpoint for this runtime generation. Failure
+/// to expose status never interrupts proxy traffic.
 pub fn spawn_runtime_status_server(
-    _config: PathBuf,
-    _registry: RuntimeRegistry,
-    _shutdown: broadcast::Receiver<bool>,
+    config_path: PathBuf,
+    registry: RuntimeRegistry,
+    mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
+    let addr = status_socket_addr(&config_path)?;
+    let listener = std::os::unix::net::UnixListener::bind_addr(&addr)
+        .context("failed to bind runtime status endpoint")?;
+    listener
+        .set_nonblocking(true)
+        .context("failed to configure runtime status endpoint")?;
+    let listener =
+        tokio::net::UnixListener::from_std(listener).context("failed to adopt status endpoint")?;
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, _)) => {
+                            tokio::spawn(answer_status_request(stream, registry.clone()));
+                        }
+                        Err(error) => {
+                            warn!("runtime status socket accept failed: {}", error);
+                            break;
+                        }
+                    }
+                }
+                _ = shutdown_rx.recv() => break,
+            }
+        }
+    });
     Ok(())
 }
-pub fn query_runtime_status(_config: &Path) -> Result<RuntimeSnapshot> {
-    bail!("runtime status endpoint is not available on Linux")
+
+/// Query the fixed local socket verb. A missing/stopped endpoint is returned
+/// as an error so `status` can render `runtime: null` without failing the
+/// static service/config query.
+pub fn query_runtime_status(config_path: &Path) -> Result<RuntimeSnapshot> {
+    let addr = status_socket_addr(config_path)?;
+    let mut stream = std::os::unix::net::UnixStream::connect_addr(&addr)
+        .with_context(|| format!("runtime status unavailable for {}", config_path.display()))?;
+    stream
+        .write_all(STATUS_REQUEST)
+        .context("failed to request runtime status")?;
+    stream
+        .flush()
+        .context("failed to flush runtime status request")?;
+    let mut length = [0u8; 4];
+    stream
+        .read_exact(&mut length)
+        .context("failed to read runtime status response length")?;
+    let length = u32::from_le_bytes(length) as usize;
+    if length > MAX_STATUS_RESPONSE {
+        bail!("runtime status response exceeds the maximum size");
+    }
+    let mut response = vec![0; length];
+    stream
+        .read_exact(&mut response)
+        .context("failed to read runtime status response")?;
+    serde_json::from_slice(&response).context("invalid runtime status response")
 }
 pub fn query_service_state(role: &str, name: &str) -> Option<(String, Option<u32>)> {
     match init().ok()? {
         Init::Systemd => super::systemd::query_named_service(role, name),
         Init::OpenRc => super::openrc::query_named_service(role, name),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn runtime_status_socket_round_trip_and_missing_endpoint() {
+        let dir = std::env::temp_dir().join(format!(
+            "rathole-x-status-sock-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("service.toml");
+        std::fs::write(&config, "[client]\nremote_addr = \"127.0.0.1:1\"\n").unwrap();
+        // No listener yet: the query must fail instead of hanging.
+        assert!(query_runtime_status(&config).is_err());
+
+        let registry =
+            crate::runtime_status::client_registry("127.0.0.1:2333", ["demo".to_owned()]);
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+        spawn_runtime_status_server(config.clone(), registry, shutdown_rx).unwrap();
+        let queried_config = config.clone();
+        let snapshot = tokio::task::spawn_blocking(move || query_runtime_status(&queried_config))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.services.len(), 1);
+        let _ = shutdown_tx.send(true);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
