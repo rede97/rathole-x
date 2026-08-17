@@ -24,14 +24,20 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # Lint Linux without OpenSSL: the native-tls backend needs a system
+      # OpenSSL, so Linux CI standardizes on the rustls feature set (the same
+      # one the musl build legs use). Windows build legs still compile the
+      # default native-tls/Schannel feature set.
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        run: >
+          cargo clippy -- -D warnings
+          --no-default-features --features server,client,rustls,noise,websocket-rustls,hot-reload
       - name: Setup cargo-hack
         run: cargo install cargo-hack
       - name: Check all features
         run: >
           cargo hack check --feature-powerset --no-dev-deps
-          --mutually-exclusive-features default,native-tls,websocket-native-tls,rustls,websocket-rustls
+          --exclude-features default,native-tls,websocket-native-tls
 
   build:
     name: Build ${{ matrix.target }}
