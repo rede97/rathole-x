@@ -1,2 +1,0 @@
-66335139f382822c7b379ccb2653a3c264bc0c08fa9b8a4c0e28aaccc06e3726  rathole-x-x86_64-unknown-linux-musl.tar.gz
-e3d343e0739f08d3c2f497aa8280cfeb673236cc8ad9e48c8cfed3cf6075e739  rathole-x-armv7-unknown-linux-musleabihf.tar.gz
