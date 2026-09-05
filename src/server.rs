@@ -43,6 +43,20 @@ const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
                                   // Timeout for the whole hello/auth phase of an incoming connection, so an
                                   // unauthenticated peer cannot hold the connection (and its fd) forever
 const HELLO_AUTH_TIMEOUT: u64 = 10;
+// Lower bound for data_channel_timeout
+const MIN_DATA_CHANNEL_TIMEOUT: Duration = Duration::from_secs(10);
+
+// A requested data channel must arrive within this budget. Otherwise the
+// control channel is stuck (a half-open connection whose writes still
+// succeed, or a client that cannot open new connections to the server) and
+// is torn down with an error so the client reconnects. Visitors would
+// otherwise hang forever waiting in the connection pool.
+fn data_channel_timeout(heartbeat_interval: u64) -> Duration {
+    std::cmp::max(
+        Duration::from_secs(heartbeat_interval.saturating_mul(2)),
+        MIN_DATA_CHANNEL_TIMEOUT,
+    )
+}
 
 // The entrypoint of running a server
 pub async fn run_server(
@@ -377,6 +391,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
             conn,
             service_config,
             server_config.heartbeat_interval,
+            data_channel_timeout(server_config.heartbeat_interval),
             runtime.clone(),
             source_addr,
             connected_since,
@@ -414,6 +429,9 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
                 .send(conn)
                 .await
                 .with_context(|| "Data channel for a stale control channel")?;
+            // Tell the control channel one of its requests was fulfilled,
+            // so it can re-arm its data channel deadline
+            let _ = handle.data_ch_arrived_tx.send(());
         }
         None => {
             warn!("Data channel has incorrect nonce");
@@ -426,6 +444,7 @@ pub struct ControlChannelHandle<T: Transport> {
     // Shutdown the control channel by dropping it
     _shutdown_tx: broadcast::Sender<bool>,
     data_ch_tx: mpsc::Sender<T::Stream>,
+    data_ch_arrived_tx: mpsc::UnboundedSender<()>,
     service: ServerServiceConfig,
 }
 
@@ -439,6 +458,7 @@ where
         conn: T::Stream,
         service: ServerServiceConfig,
         heartbeat_interval: u64,
+        data_ch_timeout: Duration,
         runtime: RuntimeRegistry,
         source_addr: std::net::SocketAddr,
         connected_since: u64,
@@ -451,6 +471,8 @@ where
 
         // Store data channel creation requests
         let (data_ch_req_tx, data_ch_req_rx) = mpsc::unbounded_channel();
+        // Tracks data channels handed over in do_data_channel_handshake
+        let (data_ch_arrived_tx, data_ch_arrived_rx) = mpsc::unbounded_channel();
 
         // Cache some data channels for later use
         let pool_size = match service.service_type {
@@ -504,7 +526,9 @@ where
             conn,
             shutdown_rx,
             data_ch_req_rx,
+            data_ch_arrived_rx,
             heartbeat_interval,
+            data_ch_timeout,
             service_name: service.name.clone(),
             runtime,
             source_addr,
@@ -544,6 +568,7 @@ where
         ControlChannelHandle {
             _shutdown_tx: shutdown_tx,
             data_ch_tx,
+            data_ch_arrived_tx,
             service,
         }
     }
@@ -552,7 +577,9 @@ struct ControlChannel<T: Transport> {
     conn: T::Stream,                               // The connection of control channel
     shutdown_rx: broadcast::Receiver<bool>,        // Receives the shutdown signal
     data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives visitor connections
+    data_ch_arrived_rx: mpsc::UnboundedReceiver<()>, // Fulfilled data channel requests
     heartbeat_interval: u64,                       // Application-layer heartbeat interval in secs
+    data_ch_timeout: Duration,                     // Max wait for a requested data channel
     service_name: String,
     runtime: RuntimeRegistry,
     source_addr: std::net::SocketAddr,
@@ -571,6 +598,15 @@ impl<T: Transport> ControlChannel<T> {
         let create_ch_cmd = bincode::serialize(&ControlChannelCmd::CreateDataChannel).unwrap();
         let heartbeat = bincode::serialize(&ControlChannelCmd::HeartBeat).unwrap();
 
+        // Outstanding CreateDataChannel requests. A deadline is armed while
+        // any request is unfulfilled and re-armed by every arrival; if it
+        // fires, the client is unable to deliver data channels over this
+        // (possibly half-open) connection, so the run loop errors out and
+        // the client is forced to reconnect.
+        let mut pending_data_ch: u32 = 0;
+        let mut data_ch_deadline: Option<std::pin::Pin<Box<time::Sleep>>> = None;
+        let mut arrived_rx_closed = false;
+
         // Wait for data channel requests and the shutdown signal
         loop {
             tokio::select! {
@@ -581,11 +617,41 @@ impl<T: Transport> ControlChannel<T> {
                                 error!("{:#}", e);
                                 break;
                             }
+                            pending_data_ch += 1;
+                            if data_ch_deadline.is_none() {
+                                data_ch_deadline =
+                                    Some(Box::pin(time::sleep(self.data_ch_timeout)));
+                            }
                         }
                         None => {
                             break;
                         }
                     }
+                },
+                arrived = self.data_ch_arrived_rx.recv(), if !arrived_rx_closed => {
+                    match arrived {
+                        Some(()) => {
+                            pending_data_ch = pending_data_ch.saturating_sub(1);
+                            // Channels are still being delivered; give the
+                            // oldest outstanding request a fresh budget
+                            data_ch_deadline = (pending_data_ch > 0)
+                                .then(|| Box::pin(time::sleep(self.data_ch_timeout)));
+                        }
+                        // The handle was dropped; the shutdown branch fires
+                        // next and ends the loop
+                        None => arrived_rx_closed = true,
+                    }
+                },
+                _ = async {
+                    match data_ch_deadline.as_mut() {
+                        Some(deadline) => deadline.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    bail!(
+                        "No data channel arrived within {:?}; the control channel is stuck",
+                        self.data_ch_timeout
+                    );
                 },
                 _ = time::sleep(Duration::from_secs(self.heartbeat_interval)), if self.heartbeat_interval != 0 => {
                             if let Err(e) = self.write_and_flush(&heartbeat).await {
@@ -949,5 +1015,199 @@ mod tests {
             b[i] ^= 0xff;
             assert!(!digest_eq(&a, &b), "difference at byte {} must fail", i);
         }
+    }
+    fn test_service_config(name: &str, bind_addr: &str) -> ServerServiceConfig {
+        let mut cfg = ServerServiceConfig::with_name(name);
+        cfg.bind_addr = bind_addr.to_owned();
+        cfg
+    }
+
+    // A loopback pair standing in for the client end of a control channel
+    async fn control_channel_pair() -> (TcpStream, TcpStream, std::net::SocketAddr) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_side = TcpStream::connect(addr).await.unwrap();
+        let (server_side, source_addr) = listener.accept().await.unwrap();
+        (client_side, server_side, source_addr)
+    }
+
+    #[test]
+    fn data_channel_timeout_scales_with_heartbeat_and_has_a_floor() {
+        assert_eq!(data_channel_timeout(30), Duration::from_secs(60));
+        assert_eq!(data_channel_timeout(1), MIN_DATA_CHANNEL_TIMEOUT);
+        // A disabled heartbeat must not disable the timeout
+        assert_eq!(data_channel_timeout(0), MIN_DATA_CHANNEL_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn stuck_control_channel_is_torn_down_when_no_data_channel_arrives() {
+        use crate::protocol::read_control_cmd;
+        use crate::runtime_status::{RuntimeServiceSnapshot, ServerControlState};
+
+        let runtime = runtime_status::server_registry(std::iter::empty());
+        runtime_status::server_add(&runtime, "svc".to_string());
+
+        let (mut client_side, server_side, source_addr) = control_channel_pair().await;
+        let connected_since =
+            runtime_status::server_connected(&runtime, "svc", source_addr).unwrap();
+
+        let handle = ControlChannelHandle::<TcpTransport>::new(
+            server_side,
+            test_service_config("svc", "127.0.0.1:0"),
+            0,                          // heartbeat disabled
+            Duration::from_millis(500), // test-scale data channel timeout
+            runtime.clone(),
+            source_addr,
+            connected_since,
+        );
+
+        // The pool prefetches TCP_POOL_SIZE data channels; the fake client
+        // reads the requests but never creates any.
+        let mut requested = 0;
+        while requested < TCP_POOL_SIZE {
+            match time::timeout(Duration::from_secs(2), read_control_cmd(&mut client_side))
+                .await
+                .expect("server did not request a data channel")
+                .unwrap()
+            {
+                ControlChannelCmd::CreateDataChannel => requested += 1,
+                ControlChannelCmd::HeartBeat => {}
+            }
+        }
+
+        // After the timeout the server must give up on the stuck channel and
+        // close the connection instead of letting visitors hang forever.
+        let closed = time::timeout(Duration::from_secs(5), async {
+            let mut buf = [0u8; 64];
+            loop {
+                if client_side.read(&mut buf).await.unwrap() == 0 {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "stuck control channel was not torn down");
+
+        // The runtime status must show the service waiting with the timeout
+        // recorded as the reason.
+        time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = runtime_status::snapshot(&runtime);
+                if let Some(RuntimeServiceSnapshot::Server {
+                    state,
+                    last_disconnected_or_error: Some(event),
+                    ..
+                }) = snapshot.services.get("svc")
+                {
+                    assert_eq!(*state, ServerControlState::Waiting);
+                    assert!(
+                        event.message.contains("No data channel arrived"),
+                        "unexpected disconnect reason: {}",
+                        event.message
+                    );
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("service status did not transition to waiting");
+
+        drop(handle);
+    }
+
+    #[tokio::test]
+    async fn control_channel_forwards_and_survives_when_data_channels_arrive() {
+        use crate::protocol::{read_control_cmd, read_data_cmd};
+        use crate::runtime_status::{RuntimeServiceSnapshot, ServerControlState};
+
+        let bind_addr = "127.0.0.1:12370";
+        let runtime = runtime_status::server_registry(std::iter::empty());
+        runtime_status::server_add(&runtime, "svc2".to_string());
+
+        let (mut client_side, server_side, source_addr) = control_channel_pair().await;
+        let connected_since =
+            runtime_status::server_connected(&runtime, "svc2", source_addr).unwrap();
+
+        let handle = ControlChannelHandle::<TcpTransport>::new(
+            server_side,
+            test_service_config("svc2", bind_addr),
+            0,                          // heartbeat disabled
+            Duration::from_millis(500), // test-scale data channel timeout
+            runtime.clone(),
+            source_addr,
+            connected_since,
+        );
+
+        // Route data channels to the handle, keyed by an arbitrary nonce
+        let nonce: Nonce = [7u8; HASH_WIDTH_IN_BYTES];
+        let control_channels = Arc::new(RwLock::new(ControlChannelMap::<TcpTransport>::new()));
+        control_channels
+            .write()
+            .await
+            .insert(protocol::digest(b"svc2"), nonce, handle);
+
+        // Fake client: answer every CreateDataChannel request with a data
+        // channel that echoes back whatever the visitor sends.
+        let map = control_channels.clone();
+        tokio::spawn(async move {
+            while let Ok(ControlChannelCmd::CreateDataChannel) =
+                read_control_cmd(&mut client_side).await
+            {
+                let map = map.clone();
+                tokio::spawn(async move {
+                    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let addr = listener.local_addr().unwrap();
+                    let mut data_client = TcpStream::connect(addr).await.unwrap();
+                    let (data_server, _) = listener.accept().await.unwrap();
+                    do_data_channel_handshake::<TcpTransport>(data_server, map, nonce)
+                        .await
+                        .unwrap();
+                    read_data_cmd(&mut data_client).await.unwrap();
+                    let (mut rd, mut wr) = data_client.split();
+                    let _ = io::copy(&mut rd, &mut wr).await;
+                });
+            }
+        });
+
+        // Wait for the visitor listener, then run an echo roundtrip
+        let mut visitor = time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(conn) = TcpStream::connect(bind_addr).await {
+                    break conn;
+                }
+                time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("visitor listener did not come up");
+        visitor.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        time::timeout(Duration::from_secs(2), visitor.read_exact(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf, b"ping");
+
+        // Idle well beyond the data channel timeout: with every request
+        // fulfilled there is no pending deadline, so the channel must stay
+        // up and keep forwarding.
+        time::sleep(Duration::from_millis(1200)).await;
+        let mut visitor2 = TcpStream::connect(bind_addr).await.unwrap();
+        visitor2.write_all(b"pong").await.unwrap();
+        time::timeout(Duration::from_secs(2), visitor2.read_exact(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf, b"pong");
+
+        let snapshot = runtime_status::snapshot(&runtime);
+        assert!(matches!(
+            snapshot.services.get("svc2"),
+            Some(RuntimeServiceSnapshot::Server {
+                state: ServerControlState::Connected,
+                ..
+            })
+        ));
     }
 }

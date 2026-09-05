@@ -16,6 +16,7 @@ use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
@@ -184,6 +185,25 @@ struct RunDataChannelArgs<T: Transport> {
     connector: Arc<T>,
     socket_opts: SocketOpts,
     service: ClientServiceConfig,
+    // Consecutive data channel setup failures; reset on a successful one
+    consecutive_failures: Arc<AtomicU32>,
+    // Notifies the control channel when failures hit the rebuild threshold
+    force_rebuild_tx: mpsc::Sender<u32>,
+}
+// This many data channel setup failures in a row mean the tunnel to the
+// server is broken even if the control channel itself still looks alive
+// (e.g. a firewall that keeps the established connection but drops new
+// SYNs). The control channel then rebuilds itself instead of letting
+// visitors hang forever.
+const MAX_CONSECUTIVE_DATA_CHANNEL_FAILURES: u32 = 3;
+
+// Count a data channel setup failure and signal the control channel once
+// the rebuild threshold is reached
+fn note_data_channel_failure<T: Transport>(args: &RunDataChannelArgs<T>) {
+    let failures = args.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
+    if failures >= MAX_CONSECUTIVE_DATA_CHANNEL_FAILURES {
+        let _ = args.force_rebuild_tx.try_send(failures);
+    }
 }
 
 async fn do_data_channel_handshake<T: Transport>(
@@ -224,11 +244,28 @@ async fn do_data_channel_handshake<T: Transport>(
 }
 
 async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Result<()> {
-    // Do the handshake
-    let mut conn = do_data_channel_handshake(args.clone()).await?;
+    // Phase 1: establish the channel to the server. Failures here mean the
+    // tunnel itself is broken, so they count towards a control channel
+    // rebuild.
+    let mut conn = match do_data_channel_handshake(args.clone()).await {
+        Ok(conn) => conn,
+        Err(e) => {
+            note_data_channel_failure(&args);
+            return Err(e);
+        }
+    };
+    let cmd = match read_data_cmd(&mut conn).await {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            note_data_channel_failure(&args);
+            return Err(e);
+        }
+    };
+    args.consecutive_failures.store(0, Ordering::SeqCst);
 
-    // Forward
-    match read_data_cmd(&mut conn).await? {
+    // Phase 2: forward. Failures below are local (e.g. the local service is
+    // down) and must not count against the tunnel.
+    match cmd {
         DataChannelCmd::StartForwardTcp => {
             if args.service.service_type != ServiceType::Tcp {
                 bail!("Expect TCP traffic. Please check the configuration.")
@@ -435,6 +472,9 @@ struct ControlChannel<T: Transport> {
     transport: Arc<T>,                  // Wrapper around the transport layer
     heartbeat_timeout: u64,             // Application layer heartbeat timeout in secs
     runtime: RuntimeRegistry,
+    // Data channel tasks report persistent setup failures here
+    force_rebuild_tx: mpsc::Sender<u32>,
+    force_rebuild_rx: mpsc::Receiver<u32>,
 }
 
 // Handle of a control channel
@@ -509,6 +549,8 @@ impl<T: 'static + Transport> ControlChannel<T> {
             connector: self.transport.clone(),
             socket_opts,
             service: self.service.clone(),
+            consecutive_failures: Arc::new(AtomicU32::new(0)),
+            force_rebuild_tx: self.force_rebuild_tx.clone(),
         });
 
         loop {
@@ -530,6 +572,16 @@ impl<T: 'static + Transport> ControlChannel<T> {
                 },
                 _ = time::sleep(Duration::from_secs(self.heartbeat_timeout)), if self.heartbeat_timeout != 0 => {
                     return Err(anyhow!("Heartbeat timed out"))
+                }
+                failures = self.force_rebuild_rx.recv() => {
+                    match failures {
+                        Some(n) => bail!(
+                            "Data channel setup failed {} times in a row; rebuilding the control channel",
+                            n
+                        ),
+                        // The sender is owned by this struct; unreachable
+                        None => break,
+                    }
                 }
                 _ = &mut self.shutdown_rx => {
                     break;
@@ -555,6 +607,7 @@ impl ControlChannelHandle {
 
         info!("Starting {}", hex::encode(digest));
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (force_rebuild_tx, force_rebuild_rx) = mpsc::channel(1);
 
         let mut retry_backoff = run_control_chan_backoff(service.retry_interval.unwrap());
 
@@ -566,6 +619,8 @@ impl ControlChannelHandle {
             transport,
             heartbeat_timeout,
             runtime,
+            force_rebuild_tx,
+            force_rebuild_rx,
         };
 
         tokio::spawn(
@@ -609,5 +664,97 @@ impl ControlChannelHandle {
     fn shutdown(self) {
         // A send failure shows that the actor has already shutdown.
         let _ = self.shutdown_tx.send(0u8);
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::TransportConfig;
+    use crate::protocol::read_auth;
+    use tokio::net::TcpListener;
+
+    // A fake server completes control channel handshakes and asks for data
+    // channels, but kills every data channel immediately. After
+    // MAX_CONSECUTIVE_DATA_CHANNEL_FAILURES the client must tear the
+    // control channel down and reconnect instead of hanging forever.
+    #[tokio::test]
+    async fn control_channel_rebuilds_after_consecutive_data_channel_failures() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (rebuilt_tx, mut rebuilt_rx) = mpsc::channel::<()>(1);
+        tokio::spawn(async move {
+            let control_count = Arc::new(AtomicU32::new(0));
+            loop {
+                let (mut conn, _) = listener.accept().await.unwrap();
+                let control_count = control_count.clone();
+                let rebuilt_tx = rebuilt_tx.clone();
+                tokio::spawn(async move {
+                    match read_hello(&mut conn).await {
+                        Ok(Hello::ControlChannelHello(_, _)) => {
+                            // Complete the handshake without validating auth
+                            let nonce = [9u8; HASH_WIDTH_IN_BYTES];
+                            conn.write_all(
+                                &bincode::serialize(&Hello::ControlChannelHello(
+                                    CURRENT_PROTO_VERSION,
+                                    nonce,
+                                ))
+                                .unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                            let _ = read_auth(&mut conn).await.unwrap();
+                            conn.write_all(&bincode::serialize(&Ack::Ok).unwrap())
+                                .await
+                                .unwrap();
+
+                            if control_count.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                                let _ = rebuilt_tx.try_send(());
+                            }
+
+                            // Ask for data channels; every one is killed below
+                            for _ in 0..MAX_CONSECUTIVE_DATA_CHANNEL_FAILURES {
+                                conn.write_all(
+                                    &bincode::serialize(&ControlChannelCmd::CreateDataChannel)
+                                        .unwrap(),
+                                )
+                                .await
+                                .unwrap();
+                            }
+
+                            // Hold the channel open until the client goes away
+                            let mut buf = [0u8; 64];
+                            while conn.read(&mut buf).await.unwrap_or(0) != 0 {}
+                        }
+                        // Kill the data channel before sending any command
+                        Ok(Hello::DataChannelHello(_, _)) => drop(conn),
+                        _ => {}
+                    }
+                });
+            }
+        });
+
+        let mut service = ClientServiceConfig::with_name("svc");
+        service.local_addr = "127.0.0.1:1".to_string(); // never reached
+        service.token = Some("token".into());
+        service.retry_interval = Some(1);
+
+        let runtime =
+            runtime_status::client_registry(&addr.to_string(), ["svc".to_string()]);
+        let transport = Arc::new(TcpTransport::new(&TransportConfig::default()).unwrap());
+        let handle = ControlChannelHandle::new::<TcpTransport>(
+            service,
+            addr.to_string(),
+            transport,
+            0, // heartbeat timeout disabled; the fake server sends nothing
+            runtime,
+        );
+
+        time::timeout(Duration::from_secs(10), rebuilt_rx.recv())
+            .await
+            .expect("client did not rebuild the control channel")
+            .unwrap();
+
+        handle.shutdown();
     }
 }
